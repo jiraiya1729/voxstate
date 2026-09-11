@@ -1,0 +1,2 @@
+class VoiceRuntimeError(Exception):
+    pass

@@ -1,0 +1,45 @@
+[project]
+name = "voxstate-server"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic>=1.14,<2.0",
+  "asyncpg>=0.30,<1.0",
+  "boto3>=1.40,<2.0",
+  "cartesia[websockets]>=4.2,<5.0",
+  "fastapi>=0.115,<1.0",
+  "pydantic-settings>=2.7,<3.0",
+  "python-multipart>=0.0.20,<1.0",
+  "sqlalchemy[asyncio]>=2.0,<3.0",
+  "twilio>=9.10,<10.0",
+  "uvicorn[standard]>=0.30,<1.0",
+]
+
+[dependency-groups]
+dev = [
+  "anyio>=4.0,<4.15",
+  "httpx2>=2.0,<3.0",
+  "pytest>=8,<9",
+  "pytest-asyncio>=1.0,<2.0",
+  "ruff>=0.8,<1.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]

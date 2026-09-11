@@ -1,0 +1,148 @@
+"use client";
+
+import { AlertCircle, ArrowUpRight, Check, Clock3, LoaderCircle, Phone, PhoneCall, RefreshCw, ShieldCheck } from "lucide-react";
+import { FormEvent, useEffect, useState } from "react";
+import type { CallResponse, HealthResponse } from "@/lib/api";
+
+type RequestState = "idle" | "submitting" | "success" | "error";
+type HealthState = "checking" | "online" | "offline";
+const E164_PATTERN = /^\+[1-9]\d{7,14}$/;
+
+export default function Home() {
+  const [destination, setDestination] = useState("");
+  const [requestState, setRequestState] = useState<RequestState>("idle");
+  const [health, setHealth] = useState<HealthState>("checking");
+  const [call, setCall] = useState<CallResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function checkHealth() {
+    setHealth("checking");
+    try {
+      const response = await fetch("/api/backend/health", { cache: "no-store" });
+      const body = (await response.json()) as HealthResponse;
+      setHealth(response.ok && body.status === "ok" ? "online" : "offline");
+    } catch {
+      setHealth("offline");
+    }
+  }
+
+  useEffect(() => { void checkHealth(); }, []);
+
+  async function initiateCall(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const normalized = destination.trim().replaceAll(" ", "");
+    setCall(null);
+    setError(null);
+    if (!E164_PATTERN.test(normalized)) {
+      setRequestState("error");
+      setError("Use the full number with country code, for example +1 415 555 2671.");
+      return;
+    }
+    setRequestState("submitting");
+    try {
+      const response = await fetch("/api/calls", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to: normalized }),
+      });
+      const body = (await response.json()) as CallResponse | { detail?: unknown };
+      if (!response.ok) {
+        const message = "detail" in body ? formatError(body.detail) : "The call could not be started.";
+        throw new Error(message);
+      }
+      setCall(body as CallResponse);
+      setRequestState("success");
+    } catch (caught) {
+      setRequestState("error");
+      setError(caught instanceof Error ? caught.message : "The call could not be started.");
+    }
+  }
+
+  const isSubmitting = requestState === "submitting";
+  const isReady = health === "online";
+
+  return (
+    <main className="shell">
+      <header className="topbar">
+        <a className="brand" href="#top" aria-label="Voxstate home">
+          <span className="brand-mark" aria-hidden="true"><i /><i /><i /><i /></span>
+          <span>Voxstate</span>
+        </a>
+        <button className="availability" type="button" onClick={checkHealth} aria-label="Check service status">
+          <span className={`status-dot status-${health}`} />
+          <span>{isReady ? "Ready to call" : health === "offline" ? "Unavailable" : "Connecting"}</span>
+          <RefreshCw size={14} className={health === "checking" ? "spin" : ""} />
+        </button>
+      </header>
+
+      <section className="workspace" id="top">
+        <div className="call-area">
+          <p className="eyebrow">Outbound calling</p>
+          <h1>Who would you like to call?</h1>
+          <p className="intro">Enter a phone number and Voxstate will start the conversation for you.</p>
+
+          <form className="call-form" onSubmit={initiateCall}>
+            <label htmlFor="destination">Phone number</label>
+            <div className="number-input">
+              <span className="input-icon"><Phone size={19} aria-hidden="true" /></span>
+              <input id="destination" name="destination" type="tel" inputMode="tel" autoComplete="tel"
+                placeholder="+1 415 555 2671" value={destination}
+                onChange={(event) => setDestination(event.target.value)}
+                aria-describedby="number-hint" disabled={isSubmitting} />
+              <span className="format-label">INTL</span>
+            </div>
+            <div className="form-meta">
+              <p id="number-hint">Include the country code</p>
+              <span><ShieldCheck size={14} /> Secure connection</span>
+            </div>
+            <button className="call-button" type="submit" disabled={isSubmitting || !isReady}>
+              {isSubmitting ? <LoaderCircle className="spin" size={19} /> : <PhoneCall size={19} />}
+              {isSubmitting ? "Starting call..." : "Start call"}
+            </button>
+          </form>
+
+          <div className="result-region" aria-live="polite">
+            {requestState === "idle" && <div className="idle-note"><Clock3 size={16} /><span>Your call status will appear here.</span></div>}
+            {requestState === "submitting" && <div className="notice neutral"><LoaderCircle className="spin" size={19} /><div><strong>Connecting your call</strong><span>This usually takes a few seconds.</span></div></div>}
+            {requestState === "success" && call && (
+              <div className="notice success">
+                <span className="notice-icon"><Check size={18} /></span>
+                <div><strong>Call started</strong><span>We're calling {destination} now.</span></div>
+                <span className="call-status">{call.status}</span>
+              </div>
+            )}
+            {requestState === "error" && error && <div className="notice error"><AlertCircle size={19} /><div><strong>Call not started</strong><span>{error}</span></div></div>}
+          </div>
+        </div>
+
+        <aside className="activity-panel">
+          <div className="activity-top">
+            <span className="phone-orbit"><PhoneCall size={28} /></span>
+            <p>Calls made with Voxstate</p>
+            <strong>Natural conversations,<br />started in one click.</strong>
+          </div>
+          <div className="activity-bottom">
+            <div><p className="eyebrow">Today</p><h2>Recent calls</h2></div>
+            {call ? (
+              <div className="recent-call">
+                <span className="recent-icon"><Phone size={17} /></span>
+                <div><strong>{destination}</strong><small>Just now · {call.status}</small></div>
+                <ArrowUpRight size={17} />
+              </div>
+            ) : <div className="no-calls"><span>0</span><p>No calls yet today</p></div>}
+          </div>
+        </aside>
+      </section>
+      <footer className="footer"><span>Voxstate</span><span>Voice conversations, on demand.</span></footer>
+    </main>
+  );
+}
+
+function formatError(detail: unknown): string {
+  if (typeof detail === "string") return detail;
+  if (detail && typeof detail === "object" && "code" in detail) {
+    const code = String(detail.code).replaceAll("_", " ");
+    return code.charAt(0).toUpperCase() + code.slice(1);
+  }
+  return "The call could not be started. Please try again.";
+}

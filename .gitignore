@@ -157,6 +157,14 @@ ENV/
 env.bak/
 venv.bak/
 
+# Local AI-agent guidance
+/.agents/
+/AGENTS.md
+
+# Frontend source must not be hidden by the Python `lib/` rule above.
+!/client/lib/
+!/client/lib/**
+
 # Spyder project settings
 .spyderproject
 .spyproject
