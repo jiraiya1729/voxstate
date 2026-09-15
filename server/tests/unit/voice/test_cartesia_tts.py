@@ -4,12 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.voice.cartesia_tts import CartesiaSpeechSynthesizer
-from app.voice.synthesis import (
+from app.voice.conversation.synthesis import (
     EmptySynthesisInputError,
     EmptySynthesisResponseError,
     SynthesisProviderError,
 )
+from app.voice.providers.cartesia_tts import CartesiaSpeechSynthesizer
 
 
 class FakeContext:

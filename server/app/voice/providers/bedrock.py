@@ -1,8 +1,14 @@
+"""AWS Bedrock language-model adapter.
+
+This file converts Voxstate's provider-neutral message history into Bedrock Converse
+requests and normalizes provider, timeout, and malformed-response failures.
+"""
+
 import asyncio
 from collections.abc import Sequence
 from typing import Any, Protocol
 
-from app.voice.response import (
+from app.voice.conversation.response import (
     EmptyModelInputError,
     Message,
     MessageRole,
@@ -13,12 +19,16 @@ from app.voice.response import (
 
 
 class BedrockRuntimeClient(Protocol):
+    """Subset of the boto3 Bedrock Runtime client used by the language adapter."""
+
     def converse(self, **kwargs: Any) -> object: ...
 
     def close(self) -> None: ...
 
 
 class BedrockLanguageModel:
+    """Adapts Voxstate conversation messages to AWS Bedrock Converse requests."""
+
     def __init__(
         self,
         *,
@@ -36,6 +46,7 @@ class BedrockLanguageModel:
         system_prompt: str,
         messages: Sequence[Message],
     ) -> str:
+        """Generate one assistant response from ordered conversation history."""
         self._validate_input(system_prompt=system_prompt, messages=messages)
 
         try:
@@ -71,6 +82,7 @@ class BedrockLanguageModel:
         system_prompt: str,
         messages: Sequence[Message],
     ) -> None:
+        """Reject malformed model input before spending a provider request."""
         if not system_prompt.strip():
             raise EmptyModelInputError("system prompt must not be empty")
         if not messages:
@@ -82,6 +94,7 @@ class BedrockLanguageModel:
 
     @staticmethod
     def _parse_response(response: object) -> str:
+        """Extract assistant text from Bedrock's Converse response shape."""
         if not isinstance(response, dict):
             raise ModelResponseError("Bedrock returned a malformed response")
 

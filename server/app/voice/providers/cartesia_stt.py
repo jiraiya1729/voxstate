@@ -1,3 +1,8 @@
+"""Cartesia streaming speech-to-text adapter.
+
+This file opens Cartesia STT, forwards Twilio audio, and normalizes events.
+"""
+
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -5,8 +10,7 @@ from typing import Protocol
 
 from cartesia import AsyncCartesia
 
-from app.voice.errors import VoiceRuntimeError
-from app.voice.transcription import (
+from app.voice.conversation.transcription import (
     StreamingTranscriber,
     TranscriptEvent,
     TranscriptHandler,
@@ -14,9 +18,12 @@ from app.voice.transcription import (
     TranscriptionSessionClosedError,
     TranscriptKind,
 )
+from app.voice.errors import VoiceRuntimeError
 
 
 class _CartesiaConnection(Protocol):
+    """Subset of Cartesia's STT WebSocket connection used by the adapter."""
+
     def __aiter__(self) -> AsyncIterator[object]: ...
 
     async def send_raw(self, data: bytes | str) -> None: ...
@@ -27,24 +34,38 @@ class _CartesiaConnection(Protocol):
 
 
 def normalize_cartesia_event(event: object) -> TranscriptEvent | None:
+    """Translate Cartesia STT events into Voxstate transcript events."""
     event_type = getattr(event, "type", None)
 
     if event_type == "error":
         message = getattr(event, "message", None) or "Cartesia STT error"
         raise TranscriptionError(str(message))
 
-    if event_type not in {"turn.update", "turn.end"}:
+    if event_type == "turn.start":
+        return TranscriptEvent(text="", kind=TranscriptKind.SPEECH_STARTED)
+
+    if event_type == "turn.resume":
+        return TranscriptEvent(text="", kind=TranscriptKind.RESUMED)
+
+    transcript_kinds = {
+        "turn.update": TranscriptKind.PARTIAL,
+        "turn.eager_end": TranscriptKind.EAGER_END,
+        "turn.end": TranscriptKind.FINAL,
+    }
+    kind = transcript_kinds.get(event_type)
+    if kind is None:
         return None
 
     transcript = getattr(event, "transcript", None)
     if not isinstance(transcript, str) or not transcript.strip():
         return None
 
-    kind = TranscriptKind.FINAL if event_type == "turn.end" else TranscriptKind.PARTIAL
     return TranscriptEvent(text=transcript, kind=kind)
 
 
 class CartesiaStreamingTranscriber(StreamingTranscriber):
+    """Active Cartesia STT stream that forwards audio and receives transcript events."""
+
     def __init__(
         self,
         *,
@@ -59,6 +80,7 @@ class CartesiaStreamingTranscriber(StreamingTranscriber):
         self._reader_task = asyncio.create_task(self._receive_events())
 
     async def send_audio(self, audio: bytes) -> None:
+        """Send one Twilio audio frame to Cartesia unless the STT session failed."""
         if self._closed:
             raise TranscriptionSessionClosedError("STT session is closed")
         self._raise_if_failed()
@@ -73,6 +95,7 @@ class CartesiaStreamingTranscriber(StreamingTranscriber):
         self._raise_if_failed()
 
     async def close(self) -> bool:
+        """Close the STT stream once and stop its background reader task."""
         async with self._close_lock:
             if self._closed:
                 return False
@@ -91,6 +114,7 @@ class CartesiaStreamingTranscriber(StreamingTranscriber):
             return True
 
     async def _receive_events(self) -> None:
+        """Background task that converts provider events into transcript callbacks."""
         try:
             async for provider_event in self._connection:
                 event = normalize_cartesia_event(provider_event)
@@ -110,11 +134,14 @@ class CartesiaStreamingTranscriber(StreamingTranscriber):
                 )
 
     def _raise_if_failed(self) -> None:
+        """Surface asynchronous STT reader failures on the audio send path."""
         if self._failure is not None:
             raise self._failure
 
 
 class CartesiaSTTProvider:
+    """Factory for Cartesia streaming STT sessions configured for Twilio audio."""
+
     def __init__(self, client: AsyncCartesia) -> None:
         self._client = client
 
@@ -123,6 +150,7 @@ class CartesiaSTTProvider:
         *,
         on_transcript: TranscriptHandler,
     ) -> StreamingTranscriber:
+        """Open a Cartesia STT WebSocket and attach Voxstate's transcript handler."""
         try:
             connection = await self._client.stt.auto_finalize.websocket(
                 encoding="pcm_mulaw",

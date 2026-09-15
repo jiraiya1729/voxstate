@@ -1,7 +1,15 @@
+"""Pure call lifecycle rules.
+
+This file normalizes provider statuses and decides whether a status callback is legal,
+duplicate, stale, terminal, or unsupported.
+"""
+
 from enum import StrEnum
 
 
 class CallStatus(StrEnum):
+    """Internal call lifecycle states normalized from provider statuses."""
+
     PENDING = "pending"
     QUEUED = "queued"
     INITIATED = "initiated"
@@ -54,6 +62,7 @@ class ProviderCallMismatchError(ValueError):
 
 
 def normalize_provider_status(provider_status: str) -> CallStatus:
+    """Convert a Twilio/provider status string into an internal CallStatus."""
     try:
         return PROVIDER_STATUS_MAP[provider_status.strip().lower()]
     except KeyError as exc:
@@ -63,6 +72,7 @@ def normalize_provider_status(provider_status: str) -> CallStatus:
 def resolve_call_transition(
     current_status: str, provider_status: str
 ) -> CallStatus | None:
+    """Return the next legal status, or None for duplicate/stale callbacks."""
     current = CallStatus(current_status)
     target = normalize_provider_status(provider_status)
 

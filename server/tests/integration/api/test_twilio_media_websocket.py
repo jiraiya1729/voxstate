@@ -11,7 +11,7 @@ from app.api.dependencies import (
     get_twilio_webhook_verifier,
 )
 from app.main import create_app
-from app.voice.response import ModelProviderError
+from app.voice.conversation.response import ModelProviderError
 
 
 class StubVerifier:
@@ -27,17 +27,24 @@ class RecordingMediaService:
         self.started = 0
         self.media = 0
         self.stopped = 0
+        self.marks: list[str] = []
         self.disconnects: list[str | None] = []
         self.audio_sink: Callable[[bytes], Awaitable[None]] | None = None
+        self.clear_sink: Callable[[], Awaitable[None]] | None = None
+        self.mark_sink: Callable[[str], Awaitable[None]] | None = None
 
     async def start(
         self,
         message: object,
         *,
         audio_sink: Callable[[bytes], Awaitable[None]],
+        clear_sink: Callable[[], Awaitable[None]],
+        mark_sink: Callable[[str], Awaitable[None]],
     ) -> SimpleNamespace:
         self.started += 1
         self.audio_sink = audio_sink
+        self.clear_sink = clear_sink
+        self.mark_sink = mark_sink
         return SimpleNamespace(stream_sid="MZ0001")
 
     async def receive_media(self, message: object) -> None:
@@ -45,6 +52,10 @@ class RecordingMediaService:
 
     async def stop(self, message: object) -> bool:
         self.stopped += 1
+        return True
+
+    async def complete_playback(self, message: object) -> bool:
+        self.marks.append(message.mark.name)
         return True
 
     async def disconnect(self, stream_sid: str | None) -> bool:
@@ -103,6 +114,12 @@ STOP = {
     "streamSid": "MZ0001",
     "stop": {"accountSid": "AC0001", "callSid": "CA0001"},
 }
+MARK = {
+    "event": "mark",
+    "sequenceNumber": "3",
+    "streamSid": "MZ0001",
+    "mark": {"name": "turn-1"},
+}
 
 
 def create_test_app(service: RecordingMediaService, valid: bool = True):
@@ -124,10 +141,12 @@ def test_complete_websocket_sequence_is_dispatched() -> None:
             websocket.send_text(json.dumps(CONNECTED))
             websocket.send_text(json.dumps(START))
             websocket.send_text(json.dumps(MEDIA))
+            websocket.send_text(json.dumps(MARK))
             websocket.send_text(json.dumps(STOP))
 
     assert service.started == 1
     assert service.media == 1
+    assert service.marks == ["turn-1"]
     assert service.stopped == 1
     assert service.disconnects == [None]
 

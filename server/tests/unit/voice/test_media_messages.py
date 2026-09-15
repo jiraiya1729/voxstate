@@ -1,11 +1,15 @@
 import json
+from collections.abc import Callable
 
 import pytest
 
-from app.voice.media_messages import (
+from app.voice.twilio.media_messages import (
     MalformedMediaMessage,
+    MarkMessage,
     MediaMessage,
     StartMessage,
+    build_outbound_clear_message,
+    build_outbound_mark_message,
     build_outbound_media_message,
     parse_media_message,
 )
@@ -17,6 +21,40 @@ def test_outbound_media_message_base64_encodes_audio() -> None:
         "streamSid": "MZ0001",
         "media": {"payload": "AQID"},
     }
+
+
+def test_outbound_playback_control_messages_are_typed() -> None:
+    assert build_outbound_clear_message("MZ0001") == {
+        "event": "clear",
+        "streamSid": "MZ0001",
+    }
+    assert build_outbound_mark_message("MZ0001", "turn-7") == {
+        "event": "mark",
+        "streamSid": "MZ0001",
+        "mark": {"name": "turn-7"},
+    }
+
+    inbound = parse_media_message(
+        '{"event":"mark","sequenceNumber":"3","streamSid":"MZ0001",'
+        '"mark":{"name":"turn-7"}}'
+    )
+    assert isinstance(inbound, MarkMessage)
+    assert inbound.mark.name == "turn-7"
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: build_outbound_clear_message(" "),
+        lambda: build_outbound_mark_message(" ", "turn-1"),
+        lambda: build_outbound_mark_message("MZ0001", " "),
+    ],
+)
+def test_playback_control_messages_reject_empty_identity(
+    factory: Callable[[], object],
+) -> None:
+    with pytest.raises(ValueError):
+        factory()
 
 
 def test_start_message_is_typed() -> None:

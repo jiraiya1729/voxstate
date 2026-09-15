@@ -5,15 +5,15 @@ from typing import Any
 
 import pytest
 
-from app.voice.cartesia_stt import (
-    CartesiaStreamingTranscriber,
-    CartesiaSTTProvider,
-    normalize_cartesia_event,
-)
-from app.voice.transcription import (
+from app.voice.conversation.transcription import (
     TranscriptEvent,
     TranscriptionError,
     TranscriptKind,
+)
+from app.voice.providers.cartesia_stt import (
+    CartesiaStreamingTranscriber,
+    CartesiaSTTProvider,
+    normalize_cartesia_event,
 )
 
 
@@ -47,8 +47,17 @@ class FakeConnection:
 
 def test_cartesia_events_are_normalized() -> None:
     assert normalize_cartesia_event(
+        SimpleNamespace(type="turn.start")
+    ) == TranscriptEvent(text="", kind=TranscriptKind.SPEECH_STARTED)
+    assert normalize_cartesia_event(
         SimpleNamespace(type="turn.update", transcript="hello")
     ) == TranscriptEvent(text="hello", kind=TranscriptKind.PARTIAL)
+    assert normalize_cartesia_event(
+        SimpleNamespace(type="turn.eager_end", transcript="hello maybe")
+    ) == TranscriptEvent(text="hello maybe", kind=TranscriptKind.EAGER_END)
+    assert normalize_cartesia_event(
+        SimpleNamespace(type="turn.resume")
+    ) == TranscriptEvent(text="", kind=TranscriptKind.RESUMED)
     assert normalize_cartesia_event(
         SimpleNamespace(type="turn.end", transcript="hello there")
     ) == TranscriptEvent(text="hello there", kind=TranscriptKind.FINAL)
@@ -58,10 +67,8 @@ def test_cartesia_events_are_normalized() -> None:
     "event",
     [
         SimpleNamespace(type="connected"),
-        SimpleNamespace(type="turn.start"),
-        SimpleNamespace(type="turn.eager_end", transcript="maybe"),
-        SimpleNamespace(type="turn.resume"),
         SimpleNamespace(type="turn.update", transcript="   "),
+        SimpleNamespace(type="turn.eager_end", transcript=""),
         SimpleNamespace(type="turn.end", transcript=""),
     ],
 )
@@ -89,7 +96,10 @@ async def test_stream_forwards_audio_and_transcripts_then_closes() -> None:
         on_transcript=record,
     )
     await stream.send_audio(b"\xff\x7f")
+    await connection.events.put(SimpleNamespace(type="turn.start"))
     await connection.events.put(SimpleNamespace(type="turn.update", transcript="hi"))
+    await connection.events.put(SimpleNamespace(type="turn.eager_end", transcript="hi"))
+    await connection.events.put(SimpleNamespace(type="turn.resume"))
     await connection.events.put(SimpleNamespace(type="turn.end", transcript="hi there"))
     await asyncio.sleep(0)
 
@@ -99,7 +109,10 @@ async def test_stream_forwards_audio_and_transcripts_then_closes() -> None:
     assert connection.commands == [{"type": "close"}]
     assert connection.closed is True
     assert transcripts == [
+        TranscriptEvent(text="", kind=TranscriptKind.SPEECH_STARTED),
         TranscriptEvent(text="hi", kind=TranscriptKind.PARTIAL),
+        TranscriptEvent(text="hi", kind=TranscriptKind.EAGER_END),
+        TranscriptEvent(text="", kind=TranscriptKind.RESUMED),
         TranscriptEvent(text="hi there", kind=TranscriptKind.FINAL),
     ]
 

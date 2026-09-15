@@ -5,7 +5,8 @@ from alembic import context
 from sqlalchemy import Connection, pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from app.calls.models import Call  # noqa: F401
+from app.agents.models import Agent, PhoneNumberRoute, RoutingRule  # noqa: F401
+from app.calls.models import Call, CallTransfer  # noqa: F401
 from app.db.base import Base
 from app.db.database import to_async_database_url
 

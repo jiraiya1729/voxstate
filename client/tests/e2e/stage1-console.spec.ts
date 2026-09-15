@@ -1,10 +1,28 @@
 import { expect, test } from "@playwright/test";
 
 test("call experience is usable", async ({ page }, testInfo) => {
+  await page.route("**/api/backend/health", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ status: "ok" }),
+    });
+  });
+  await page.route("**/api/agents", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify([
+        { id: "00000000-0000-0000-0000-000000000201", name: "Support", enabled: true },
+      ]),
+    });
+  });
+
   await page.goto("/");
 
   await expect(page.getByRole("heading", { name: "Who would you like to call?" })).toBeVisible();
   await expect(page.getByText("Ready to call")).toBeVisible();
+  await expect(page.getByLabel("Agent")).toHaveValue("00000000-0000-0000-0000-000000000201");
   await expect(page.getByRole("button", { name: /Start call/ })).toBeEnabled();
   await expect(page.getByText("Recent calls")).toBeVisible();
   await expect(page.getByText("No calls yet today")).toBeVisible();

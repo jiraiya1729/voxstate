@@ -1,22 +1,26 @@
+import asyncio
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from uuid import UUID
 
 import pytest
 
+from app.calls.lifecycle_service import CallLifecycleService
+from app.calls.outbound import CallService
 from app.calls.repository import CallRepository
-from app.calls.service import CallLifecycleService, CallService
 from app.calls.telephony import ProviderCall
 from app.db.database import Database
-from app.voice.media_messages import (
+from app.voice.conversation.response import Message, MessageRole, ModelProviderError
+from app.voice.conversation.transcription import TranscriptEvent, TranscriptKind
+from app.voice.conversation.turns import TurnMarker, TurnState
+from app.voice.sessions.service import ActiveCallRegistry, MediaSessionService
+from app.voice.twilio.media_messages import (
+    MarkMessage,
     MediaMessage,
     StartMessage,
     StopMessage,
     parse_media_message,
 )
-from app.voice.response import Message, MessageRole, ModelProviderError
-from app.voice.sessions import ActiveCallRegistry, MediaSessionService
-from app.voice.transcription import TranscriptEvent, TranscriptKind
 
 PROVIDER_CALL_ID = "CA00000000000000000000000000000099"
 
@@ -167,6 +171,7 @@ async def test_first_ai_phone_call_completes_through_fake_provider_stack(
             kind=TranscriptKind.FINAL,
         )
     )
+    await active.conversation.wait_until_idle()
     await voice.stop(stop)
     final_status = await lifecycle.apply_status_callback(
         call_id=initiated.id,
@@ -218,12 +223,114 @@ async def test_downstream_failure_is_not_reported_as_call_success(
     async def discard_playback(audio: bytes) -> None:
         del audio
 
-    await voice.start(start, audio_sink=discard_playback)
+    active = await voice.start(start, audio_sink=discard_playback)
     assert stt.handler is not None
+    await stt.handler(TranscriptEvent(text="hello", kind=TranscriptKind.FINAL))
     with pytest.raises(ModelProviderError, match="simulated Bedrock failure"):
-        await stt.handler(TranscriptEvent(text="hello", kind=TranscriptKind.FINAL))
+        await active.conversation.wait_until_idle()
 
     async with database.session() as session:
         stored = await CallRepository(session).get_by_id(initiated.id)
     assert stored is not None
     assert stored.status == "in-progress"
+
+
+@pytest.mark.asyncio
+async def test_multiturn_interruption_never_replays_stale_audio(
+    database: Database,
+) -> None:
+    class InterruptibleTTS:
+        def __init__(self) -> None:
+            self.requests = 0
+            self.first_turn_started = asyncio.Event()
+
+        async def synthesize(
+            self,
+            text: str,
+            *,
+            on_audio: Callable[[bytes], Awaitable[None]],
+        ) -> None:
+            del text
+            self.requests += 1
+            if self.requests == 1:
+                await on_audio(b"old-current")
+                self.first_turn_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await on_audio(b"old-stale")
+                    raise
+            await on_audio(b"new-current")
+
+    initiated = await CallService(
+        database=database,
+        telephony=FakeTelephony(),
+    ).initiate_call("+15555550197")
+    await CallLifecycleService(database=database).apply_status_callback(
+        call_id=initiated.id,
+        provider_call_id=PROVIDER_CALL_ID,
+        provider_status="answered",
+    )
+    stt = FakeSTT()
+    tts = InterruptibleTTS()
+    voice = MediaSessionService(
+        database=database,
+        registry=ActiveCallRegistry(),
+        stt_provider=stt,
+        language_model=FakeModel(),
+        speech_synthesizer=tts,
+    )
+    playback: list[bytes] = []
+    clears: list[bool] = []
+    marks: list[str] = []
+
+    async def capture_playback(audio: bytes) -> None:
+        playback.append(audio)
+
+    async def clear_playback() -> None:
+        clears.append(True)
+
+    async def mark_playback(name: str) -> None:
+        marks.append(name)
+
+    start, _, stop = media_messages(initiated.id)
+    active = await voice.start(
+        start,
+        audio_sink=capture_playback,
+        clear_sink=clear_playback,
+        mark_sink=mark_playback,
+    )
+    assert stt.handler is not None
+
+    await stt.handler(TranscriptEvent(text="", kind=TranscriptKind.SPEECH_STARTED))
+    await stt.handler(TranscriptEvent(text="First", kind=TranscriptKind.EAGER_END))
+    await stt.handler(TranscriptEvent(text="", kind=TranscriptKind.RESUMED))
+    await stt.handler(
+        TranscriptEvent(text="First complete turn", kind=TranscriptKind.FINAL)
+    )
+    await asyncio.wait_for(tts.first_turn_started.wait(), timeout=1)
+
+    await stt.handler(TranscriptEvent(text="", kind=TranscriptKind.SPEECH_STARTED))
+    assert active.conversation.state is TurnState.LISTENING
+
+    await stt.handler(TranscriptEvent(text="Second turn", kind=TranscriptKind.FINAL))
+    await active.conversation.wait_until_idle()
+    assert marks == ["turn-3"]
+    mark = parse_media_message(
+        '{"event":"mark","sequenceNumber":"4","streamSid":"MZ0099",'
+        '"mark":{"name":"turn-3"}}'
+    )
+    assert isinstance(mark, MarkMessage)
+    assert await voice.complete_playback(mark) is True
+    assert active.conversation.state is TurnState.LISTENING
+
+    timings = active.conversation.turn_timings
+    assert timings[0].timestamp(TurnMarker.INTERRUPTED) is not None
+    assert timings[0].timestamp(TurnMarker.COMPLETED) is None
+    assert timings[1].timestamp(TurnMarker.FIRST_PLAYBACK) is not None
+    assert timings[1].timestamp(TurnMarker.COMPLETED) is not None
+    assert playback == [b"old-current", b"new-current"]
+    assert clears == [True]
+
+    assert await voice.stop(stop) is True
+    assert active.conversation.state is TurnState.CLOSED

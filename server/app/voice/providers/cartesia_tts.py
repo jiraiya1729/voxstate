@@ -1,3 +1,9 @@
+"""Cartesia text-to-speech adapter.
+
+This file sends assistant text to Cartesia TTS and streams raw 8 kHz mu-law audio chunks
+back to Voxstate's audio sink for Twilio playback.
+"""
+
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -5,7 +11,7 @@ from typing import Protocol
 
 from cartesia import AsyncCartesia
 
-from app.voice.synthesis import (
+from app.voice.conversation.synthesis import (
     AudioSink,
     EmptySynthesisInputError,
     EmptySynthesisResponseError,
@@ -15,6 +21,8 @@ from app.voice.synthesis import (
 
 
 class _TTSContext(Protocol):
+    """Subset of a Cartesia TTS context used to push text and receive audio."""
+
     async def push(self, text: str) -> None: ...
 
     async def no_more_inputs(self) -> None: ...
@@ -25,24 +33,33 @@ class _TTSContext(Protocol):
 
 
 class _TTSConnection(Protocol):
+    """Subset of Cartesia's TTS WebSocket connection used by the adapter."""
+
     def context(self, **kwargs: object) -> _TTSContext: ...
 
     async def close(self) -> None: ...
 
 
 class CartesiaSpeechSynthesizer:
+    """Adapts assistant text to Cartesia TTS audio chunks for Twilio playback."""
+
     def __init__(
         self,
         *,
         client: AsyncCartesia,
         voice_id: str,
+        model_id: str = "sonic-latest",
+        language: str = "en",
         timeout_seconds: float = 20.0,
     ) -> None:
         self._client = client
         self._voice_id = voice_id
+        self._model_id = model_id
+        self._language = language
         self._timeout_seconds = timeout_seconds
 
     async def synthesize(self, text: str, *, on_audio: AudioSink) -> None:
+        """Stream synthesized 8 kHz mu-law audio chunks to the provided sink."""
         text = text.strip()
         if not text:
             raise EmptySynthesisInputError("speech text must not be empty")
@@ -52,14 +69,14 @@ class CartesiaSpeechSynthesizer:
         try:
             connection = await self._client.tts.websocket_connect().enter()
             context = connection.context(
-                model_id="sonic-latest",
+                model_id=self._model_id,
                 voice=self._voice_id,
                 output_format={
                     "container": "raw",
                     "encoding": "pcm_mulaw",
                     "sample_rate": 8000,
                 },
-                language="en",
+                language=self._language,
                 timeout=self._timeout_seconds,
             )
             await context.push(text)

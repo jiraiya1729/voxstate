@@ -2,8 +2,8 @@ from uuid import UUID
 
 import pytest
 
+from app.calls.outbound import CallInitiationFailed, CallService
 from app.calls.repository import CallRepository
-from app.calls.service import CallInitiationFailed, CallService
 from app.calls.telephony import ProviderCall, TelephonyProviderError
 from app.db.database import Database
 

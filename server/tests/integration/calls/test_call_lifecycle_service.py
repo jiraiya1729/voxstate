@@ -6,9 +6,9 @@ from app.calls.lifecycle import (
     ProviderCallMismatchError,
     UnknownCallError,
 )
+from app.calls.lifecycle_service import CallLifecycleService
 from app.calls.models import Call
 from app.calls.repository import CallRepository
-from app.calls.service import CallLifecycleService
 from app.db.database import Database
 
 

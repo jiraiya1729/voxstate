@@ -1,34 +1,51 @@
 "use client";
 
+// Thin operator console for checking readiness, selecting an agent, and starting calls.
+
 import { AlertCircle, ArrowUpRight, Check, Clock3, LoaderCircle, Phone, PhoneCall, RefreshCw, ShieldCheck } from "lucide-react";
 import { FormEvent, useEffect, useState } from "react";
-import type { CallResponse, HealthResponse } from "@/lib/api";
+import type { AgentResponse, CallResponse, HealthResponse } from "@/lib/api";
 
 type RequestState = "idle" | "submitting" | "success" | "error";
 type HealthState = "checking" | "online" | "offline";
 const E164_PATTERN = /^\+[1-9]\d{7,14}$/;
 
 export default function Home() {
+  // Thin operator console: load health/agents, validate a number, and start a call.
   const [destination, setDestination] = useState("");
   const [requestState, setRequestState] = useState<RequestState>("idle");
   const [health, setHealth] = useState<HealthState>("checking");
   const [call, setCall] = useState<CallResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [agents, setAgents] = useState<AgentResponse[]>([]);
+  const [agentId, setAgentId] = useState("");
 
   async function checkHealth() {
+    // Manual refresh path for the backend readiness pill.
     setHealth("checking");
-    try {
-      const response = await fetch("/api/backend/health", { cache: "no-store" });
-      const body = (await response.json()) as HealthResponse;
-      setHealth(response.ok && body.status === "ok" ? "online" : "offline");
-    } catch {
-      setHealth("offline");
-    }
+    setHealth(await fetchHealth());
   }
 
-  useEffect(() => { void checkHealth(); }, []);
+  useEffect(() => {
+    let cancelled = false;
+
+    void fetchHealth().then((nextHealth) => {
+      if (!cancelled) setHealth(nextHealth);
+    });
+    void fetchAgents().then((availableAgents) => {
+      if (!cancelled) {
+        setAgents(availableAgents);
+        setAgentId(availableAgents[0]?.id ?? "");
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function initiateCall(event: FormEvent<HTMLFormElement>) {
+    // Validate E.164 input, call the Next.js proxy, and display backend feedback.
     event.preventDefault();
     const normalized = destination.trim().replaceAll(" ", "");
     setCall(null);
@@ -43,7 +60,7 @@ export default function Home() {
       const response = await fetch("/api/calls", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ to: normalized }),
+        body: JSON.stringify({ to: normalized, agent_id: agentId || undefined }),
       });
       const body = (await response.json()) as CallResponse | { detail?: unknown };
       if (!response.ok) {
@@ -82,6 +99,18 @@ export default function Home() {
           <p className="intro">Enter a phone number and Voxstate will start the conversation for you.</p>
 
           <form className="call-form" onSubmit={initiateCall}>
+            <label htmlFor="agent">Agent</label>
+            <select
+              id="agent"
+              value={agentId}
+              onChange={(event) => setAgentId(event.target.value)}
+              disabled={isSubmitting || agents.length === 0}
+            >
+              {agents.length === 0 ? <option value="">No enabled agents</option> : null}
+              {agents.filter((agent) => agent.enabled).map((agent) => (
+                <option key={agent.id} value={agent.id}>{agent.name}</option>
+              ))}
+            </select>
             <label htmlFor="destination">Phone number</label>
             <div className="number-input">
               <span className="input-icon"><Phone size={19} aria-hidden="true" /></span>
@@ -95,7 +124,7 @@ export default function Home() {
               <p id="number-hint">Include the country code</p>
               <span><ShieldCheck size={14} /> Secure connection</span>
             </div>
-            <button className="call-button" type="submit" disabled={isSubmitting || !isReady}>
+            <button className="call-button" type="submit" disabled={isSubmitting || !isReady || !agentId}>
               {isSubmitting ? <LoaderCircle className="spin" size={19} /> : <PhoneCall size={19} />}
               {isSubmitting ? "Starting call..." : "Start call"}
             </button>
@@ -107,7 +136,7 @@ export default function Home() {
             {requestState === "success" && call && (
               <div className="notice success">
                 <span className="notice-icon"><Check size={18} /></span>
-                <div><strong>Call started</strong><span>We're calling {destination} now.</span></div>
+                <div><strong>Call started</strong><span>We&apos;re calling {destination} now.</span></div>
                 <span className="call-status">{call.status}</span>
               </div>
             )}
@@ -138,11 +167,35 @@ export default function Home() {
   );
 }
 
+async function fetchHealth(): Promise<HealthState> {
+  // Convert the backend health contract into the UI's small state machine.
+  try {
+    const response = await fetch("/api/backend/health", { cache: "no-store" });
+    const body = (await response.json()) as HealthResponse;
+    return response.ok && body.status === "ok" ? "online" : "offline";
+  } catch {
+    return "offline";
+  }
+}
+
 function formatError(detail: unknown): string {
+  // Convert FastAPI error details into a short operator-facing message.
   if (typeof detail === "string") return detail;
   if (detail && typeof detail === "object" && "code" in detail) {
     const code = String(detail.code).replaceAll("_", " ");
     return code.charAt(0).toUpperCase() + code.slice(1);
   }
   return "The call could not be started. Please try again.";
+}
+
+async function fetchAgents(): Promise<AgentResponse[]> {
+  // Load selectable agents; failures render as an empty disabled selector.
+  try {
+    const response = await fetch("/api/agents", { cache: "no-store" });
+    if (!response.ok) return [];
+    const body = (await response.json()) as AgentResponse[];
+    return body.filter((agent) => agent.enabled);
+  } catch {
+    return [];
+  }
 }

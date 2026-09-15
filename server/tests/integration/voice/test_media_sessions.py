@@ -4,23 +4,23 @@ from unittest.mock import Mock
 
 import pytest
 
-import app.voice.sessions as sessions_module
+import app.voice.sessions.service as sessions_module
 from app.calls.repository import CallRepository
 from app.db.database import Database
-from app.voice.media_messages import (
-    MediaMessage,
-    StartMessage,
-    StopMessage,
-    parse_media_message,
-)
-from app.voice.response import Message, MessageRole
-from app.voice.sessions import (
+from app.voice.conversation.response import Message, MessageRole
+from app.voice.conversation.transcription import TranscriptEvent, TranscriptKind
+from app.voice.sessions.service import (
     ActiveCallRegistry,
     DuplicateMediaSessionError,
     MediaSessionService,
     UnknownMediaCallError,
 )
-from app.voice.transcription import TranscriptEvent, TranscriptKind
+from app.voice.twilio.media_messages import (
+    MediaMessage,
+    StartMessage,
+    StopMessage,
+    parse_media_message,
+)
 
 
 class FakeTranscriber:
@@ -168,6 +168,7 @@ async def test_session_streams_media_and_normalized_transcripts(
     await stt_provider.handlers[0](
         TranscriptEvent(text="hello there", kind=TranscriptKind.FINAL)
     )
+    await active.conversation.wait_until_idle()
 
     assert active.call_id == call.id
     assert active.media_frames_received == 1

@@ -1,3 +1,9 @@
+"""Twilio bidirectional media WebSocket route.
+
+This file verifies Twilio's media stream, parses audio/control frames, forwards inbound
+audio to the live media service, and sends synthesized audio back to Twilio.
+"""
+
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
@@ -8,17 +14,20 @@ from app.api.dependencies import (
 )
 from app.calls.lifecycle import ProviderCallMismatchError
 from app.voice.errors import VoiceRuntimeError
-from app.voice.media_messages import (
+from app.voice.sessions.service import MediaSessionError, MediaSessionService
+from app.voice.twilio.gateway import TwilioWebhookVerifier
+from app.voice.twilio.media_messages import (
     ConnectedMessage,
     MalformedMediaMessage,
+    MarkMessage,
     MediaMessage,
     StartMessage,
     StopMessage,
+    build_outbound_clear_message,
+    build_outbound_mark_message,
     build_outbound_media_message,
     parse_media_message,
 )
-from app.voice.sessions import MediaSessionError, MediaSessionService
-from app.voice.twilio import TwilioWebhookVerifier
 
 router = APIRouter(tags=["twilio-media"])
 
@@ -40,6 +49,7 @@ async def receive_twilio_media(
         Depends(get_twilio_webhook_verifier),
     ],
 ) -> None:
+    """Handle Twilio's bidirectional media WebSocket for one active call."""
     signature = websocket.headers.get("X-Twilio-Signature")
     if signature is None or not verifier.validate_media_stream(signature=signature):
         await websocket.close(code=POLICY_VIOLATION)
@@ -72,7 +82,23 @@ async def receive_twilio_media(
                         build_outbound_media_message(_stream_sid, audio)
                     )
 
-                session = await service.start(message, audio_sink=send_audio)
+                async def clear_audio(_stream_sid: str = stream_sid) -> None:
+                    await websocket.send_json(build_outbound_clear_message(_stream_sid))
+
+                async def mark_audio(
+                    name: str,
+                    _stream_sid: str = stream_sid,
+                ) -> None:
+                    await websocket.send_json(
+                        build_outbound_mark_message(_stream_sid, name)
+                    )
+
+                session = await service.start(
+                    message,
+                    audio_sink=send_audio,
+                    clear_sink=clear_audio,
+                    mark_sink=mark_audio,
+                )
                 active_stream_sid = session.stream_sid
                 continue
 
@@ -80,6 +106,12 @@ async def receive_twilio_media(
                 if active_stream_sid != message.stream_sid:
                     raise MediaSessionError("media references an unknown stream")
                 await service.receive_media(message)
+                continue
+
+            if isinstance(message, MarkMessage):
+                if active_stream_sid != message.stream_sid:
+                    raise MediaSessionError("mark references an unknown stream")
+                await service.complete_playback(message)
                 continue
 
             if isinstance(message, StopMessage):

@@ -2,8 +2,8 @@ import time
 from typing import Any
 
 import pytest
-from app.voice.bedrock import BedrockLanguageModel
-from app.voice.response import (
+
+from app.voice.conversation.response import (
     EmptyModelInputError,
     Message,
     MessageRole,
@@ -11,6 +11,7 @@ from app.voice.response import (
     ModelResponseError,
     ModelTimeoutError,
 )
+from app.voice.providers.bedrock import BedrockLanguageModel
 
 
 class RecordingBedrockClient:
