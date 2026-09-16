@@ -14,6 +14,8 @@ from app.events.models import Event  # noqa: F401
 from app.workflows.models import (  # noqa: F401
     WorkflowActivityAttempt,
     WorkflowDefinitionRecord,
+    WorkflowEventSubscription,
+    WorkflowExternalEvent,
     WorkflowRun,
     WorkflowTimer,
 )

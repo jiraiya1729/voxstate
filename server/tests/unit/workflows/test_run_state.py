@@ -11,16 +11,21 @@ from app.workflows.state import (
     ("current", "target"),
     [
         ("pending", "running"),
+        ("pending", "paused"),
         ("pending", "cancelled"),
         ("pending", "failed"),
         ("running", "waiting"),
+        ("running", "paused"),
         ("running", "completed"),
         ("running", "failed"),
         ("running", "cancelled"),
         ("waiting", "running"),
+        ("waiting", "paused"),
         ("waiting", "completed"),
         ("waiting", "failed"),
         ("waiting", "cancelled"),
+        ("paused", "running"),
+        ("paused", "cancelled"),
     ],
 )
 def test_workflow_run_allows_legal_transitions(current: str, target: str) -> None:
@@ -33,6 +38,7 @@ def test_workflow_run_allows_legal_transitions(current: str, target: str) -> Non
         WorkflowRunStatus.PENDING,
         WorkflowRunStatus.RUNNING,
         WorkflowRunStatus.WAITING,
+        WorkflowRunStatus.PAUSED,
         WorkflowRunStatus.COMPLETED,
         WorkflowRunStatus.FAILED,
         WorkflowRunStatus.CANCELLED,
@@ -49,6 +55,8 @@ def test_workflow_run_idempotent_transition_returns_none(
     [
         ("pending", "completed"),
         ("waiting", "pending"),
+        ("paused", "completed"),
+        ("paused", "failed"),
         ("completed", "running"),
         ("completed", "failed"),
         ("failed", "running"),

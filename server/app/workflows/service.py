@@ -12,6 +12,7 @@ from app.cases.repository import CaseRepository
 from app.db.database import Database
 from app.workflows.definition import (
     CallActivityDefinition,
+    WaitForEventStepDefinition,
     WaitStepDefinition,
     WorkflowDefinition,
     WorkflowStep,
@@ -37,6 +38,14 @@ class WorkflowActivityMismatchError(ValueError):
     """Raised when an activity completion does not match the waiting run."""
 
 
+class ExternalEventAuthenticationError(PermissionError):
+    """Raised when external event ingestion is not authenticated."""
+
+
+class ExternalEventValidationError(ValueError):
+    """Raised when an external event payload is malformed."""
+
+
 @dataclass(frozen=True)
 class WorkflowAdvanceResult:
     """Compact result returned after advancing one workflow run."""
@@ -47,6 +56,15 @@ class WorkflowAdvanceResult:
     scheduled_call_id: UUID | None = None
     scheduled_new_activity: bool = False
     scheduled_timer_id: UUID | None = None
+
+
+@dataclass(frozen=True)
+class ExternalEventIngestResult:
+    """Result of idempotent external event ingestion."""
+
+    event_id: UUID
+    matched_run_id: UUID | None
+    was_duplicate: bool = False
 
 
 class WorkflowService:
@@ -304,10 +322,21 @@ class WorkflowService:
                     continue
                 if WorkflowRunStatus(run.status) in TERMINAL_WORKFLOW_STATUSES:
                     continue
+                if timer.kind == "timeout":
+                    subscription = await repository.mark_subscription_timed_out(
+                        run_id=timer.run_id,
+                        step_id=timer.step_id,
+                    )
+                    if subscription is None or subscription.on_timeout_step_id is None:
+                        continue
+                    wake_step_id = subscription.on_timeout_step_id
+                else:
+                    wake_step_id = timer.wake_step_id
                 await repository.transition_run(
                     run,
                     WorkflowRunStatus.RUNNING,
-                    current_step_id=timer.wake_step_id,
+                    current_step_id=wake_step_id,
+                    completed_step_id=timer.step_id,
                 )
                 run_ids.append(run.id)
 
@@ -321,7 +350,105 @@ class WorkflowService:
             repository = WorkflowRepository(session)
             run = await self._require_run_for_update(repository, run_id)
             await repository.cancel_pending_timers_for_run(run_id)
+            await repository.cancel_pending_event_subscriptions_for_run(run_id)
             return await repository.transition_run(run, WorkflowRunStatus.CANCELLED)
+
+    async def pause_run(self, run_id: UUID) -> WorkflowRun:
+        async with self.database.session() as session:
+            repository = WorkflowRepository(session)
+            run = await self._require_run_for_update(repository, run_id)
+            return await repository.transition_run(run, WorkflowRunStatus.PAUSED)
+
+    async def resume_run(
+        self, run_id: UUID, *, now: datetime | None = None
+    ) -> WorkflowAdvanceResult:
+        now = self._utc(now)
+        async with self.database.session() as session:
+            repository = WorkflowRepository(session)
+            run = await self._require_run_for_update(repository, run_id)
+            await repository.transition_run(run, WorkflowRunStatus.RUNNING)
+        return await self.advance_run(run_id, now=now)
+
+    async def ingest_external_event(
+        self,
+        *,
+        event_type: str,
+        correlation_key: str,
+        idempotency_key: str,
+        payload: dict[str, object] | None = None,
+        provided_secret: str | None = None,
+        expected_secret: str | None = None,
+        now: datetime | None = None,
+    ) -> ExternalEventIngestResult:
+        self._validate_external_event(
+            event_type=event_type,
+            correlation_key=correlation_key,
+            idempotency_key=idempotency_key,
+            provided_secret=provided_secret,
+            expected_secret=expected_secret,
+        )
+        now = self._utc(now)
+        run_id: UUID | None = None
+        async with self.database.session() as session:
+            repository = WorkflowRepository(session)
+            event, created = await repository.create_external_event(
+                event_type=event_type,
+                correlation_key=correlation_key,
+                idempotency_key=idempotency_key,
+                payload=payload,
+            )
+            if not created:
+                matched_run_id = None
+                if event.subscription_id is not None:
+                    subscription = await repository.get_event_subscription_by_id(
+                        event.subscription_id
+                    )
+                    matched_run_id = (
+                        subscription.run_id if subscription is not None else None
+                    )
+                return ExternalEventIngestResult(
+                    event_id=event.id,
+                    matched_run_id=matched_run_id,
+                    was_duplicate=True,
+                )
+            subscription = await repository.get_pending_event_subscription_for_update(
+                event_type=event_type,
+                correlation_key=correlation_key,
+            )
+            if subscription is None:
+                return ExternalEventIngestResult(
+                    event_id=event.id,
+                    matched_run_id=None,
+                )
+            run = await repository.get_run_for_update(subscription.run_id)
+            if (
+                run is None
+                or WorkflowRunStatus(run.status) in TERMINAL_WORKFLOW_STATUSES
+            ):
+                return ExternalEventIngestResult(event_id=event.id, matched_run_id=None)
+            await repository.mark_external_event_matched(
+                event=event,
+                subscription_id=subscription.id,
+            )
+            await repository.mark_subscription_consumed(
+                subscription=subscription,
+                event_id=event.id,
+            )
+            await repository.cancel_pending_timers_for_run(run.id)
+            await repository.transition_run(
+                run,
+                WorkflowRunStatus.RUNNING,
+                current_step_id=subscription.on_event_step_id,
+                completed_step_id=subscription.step_id,
+            )
+            run_id = run.id
+
+        if run_id is not None:
+            await self.advance_run(run_id, now=now)
+        return ExternalEventIngestResult(
+            event_id=event.id,
+            matched_run_id=run_id,
+        )
 
     async def _prepare_current_step(
         self, run_id: UUID, *, now: datetime
@@ -352,6 +479,15 @@ class WorkflowService:
                 )
                 run = await repository.transition_run(run, WorkflowRunStatus.WAITING)
                 return run, step, None, timer.id
+            if step.kind == "wait_for_event":
+                timer_id = await self._subscribe_to_external_event(
+                    repository=repository,
+                    run=run,
+                    step=step,
+                    now=now,
+                )
+                run = await repository.transition_run(run, WorkflowRunStatus.WAITING)
+                return run, step, None, timer_id
             scheduled_attempt = await repository.get_scheduled_attempt_for_step(
                 run_id=run_id, step_id=step.id
             )
@@ -389,6 +525,39 @@ class WorkflowService:
             idempotency_key=f"workflow-run:{run.id}:wait:{step.id}",
             payload={"delay_seconds": step.delay_seconds},
         )
+
+    async def _subscribe_to_external_event(
+        self,
+        *,
+        repository: WorkflowRepository,
+        run: WorkflowRun,
+        step: WaitForEventStepDefinition,
+        now: datetime,
+    ) -> UUID | None:
+        await repository.create_event_subscription(
+            run=run,
+            step_id=step.id,
+            event_type=step.event_type,
+            correlation_key=step.correlation_key,
+            on_event_step_id=step.on_event_step_id,
+            on_timeout_step_id=step.on_timeout_step_id,
+        )
+        if step.timeout_seconds is None:
+            return None
+        timer = await repository.create_timer(
+            run=run,
+            step_id=step.id,
+            kind="timeout",
+            due_at=now + timedelta(seconds=step.timeout_seconds),
+            wake_step_id=step.on_timeout_step_id or step.on_event_step_id,
+            idempotency_key=f"workflow-run:{run.id}:event-timeout:{step.id}",
+            payload={
+                "event_type": step.event_type,
+                "correlation_key": step.correlation_key,
+                "timeout_seconds": step.timeout_seconds,
+            },
+        )
+        return timer.id
 
     @staticmethod
     async def _require_run_for_update(
@@ -499,3 +668,22 @@ class WorkflowService:
         if value.tzinfo is None:
             return value.replace(tzinfo=UTC)
         return value.astimezone(UTC)
+
+    @staticmethod
+    def _validate_external_event(
+        *,
+        event_type: str,
+        correlation_key: str,
+        idempotency_key: str,
+        provided_secret: str | None,
+        expected_secret: str | None,
+    ) -> None:
+        if expected_secret is not None and provided_secret != expected_secret:
+            raise ExternalEventAuthenticationError("invalid external event secret")
+        for label, value in {
+            "event_type": event_type,
+            "correlation_key": correlation_key,
+            "idempotency_key": idempotency_key,
+        }.items():
+            if not value or not value.strip():
+                raise ExternalEventValidationError(f"{label} is required")

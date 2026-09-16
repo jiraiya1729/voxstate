@@ -60,6 +60,38 @@ class WaitStepDefinition(BaseModel):
     next_step_id: StepId
 
 
+class WaitForEventStepDefinition(BaseModel):
+    """A durable external-event wait with an optional persisted timeout branch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: StepId
+    kind: Literal["wait_for_event"]
+    event_type: Annotated[
+        str,
+        StringConstraints(
+            strip_whitespace=True,
+            min_length=1,
+            max_length=120,
+            pattern=r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$",
+        ),
+    ]
+    correlation_key: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)
+    ]
+    on_event_step_id: StepId
+    timeout_seconds: int | None = Field(default=None, ge=1, le=60 * 60 * 24 * 365)
+    on_timeout_step_id: StepId | None = None
+
+    @model_validator(mode="after")
+    def keep_timeout_branch_complete(self) -> "WaitForEventStepDefinition":
+        if (self.timeout_seconds is None) != (self.on_timeout_step_id is None):
+            raise ValueError(
+                "timeout_seconds and on_timeout_step_id must be set together"
+            )
+        return self
+
+
 class CompleteStepDefinition(BaseModel):
     """A terminal workflow step that completes the run successfully."""
 
@@ -71,7 +103,12 @@ class CompleteStepDefinition(BaseModel):
 
 
 WorkflowStep = Annotated[
-    CallActivityDefinition | WaitStepDefinition | CompleteStepDefinition,
+    (
+        CallActivityDefinition
+        | WaitStepDefinition
+        | WaitForEventStepDefinition
+        | CompleteStepDefinition
+    ),
     Field(discriminator="kind"),
 ]
 
@@ -107,11 +144,8 @@ class WorkflowDefinition(BaseModel):
         if self.initial_step_id not in step_ids:
             raise ValueError("initial_step_id must reference an existing step")
 
-        has_call = any(step.kind == "call" for step in self.steps)
         has_complete = any(step.kind == "complete" for step in self.steps)
 
-        if not has_call:
-            raise ValueError("workflow definition requires at least one call step")
         if not has_complete:
             raise ValueError("workflow definition requires a complete step")
 
@@ -131,5 +165,12 @@ class WorkflowDefinition(BaseModel):
                         )
             if step.kind == "wait" and step.next_step_id not in step_ids:
                 raise ValueError("wait next_step_id must reference an existing step")
+            if step.kind == "wait_for_event":
+                referenced_ids = [step.on_event_step_id, step.on_timeout_step_id]
+                for referenced_id in referenced_ids:
+                    if referenced_id is not None and referenced_id not in step_ids:
+                        raise ValueError(
+                            "event wait branch step IDs must reference existing steps"
+                        )
 
         return self

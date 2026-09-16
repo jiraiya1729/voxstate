@@ -79,6 +79,41 @@ def test_workflow_definition_accepts_wait_and_retry_policy() -> None:
     assert call_step.retry_policy.backoff == "exponential"
 
 
+def test_workflow_definition_accepts_wait_for_event_with_timeout() -> None:
+    definition = WorkflowDefinition.model_validate(
+        {
+            "name": "event-wait-workflow",
+            "initial_step_id": "wait_for_payment",
+            "steps": [
+                {
+                    "id": "wait_for_payment",
+                    "kind": "wait_for_event",
+                    "event_type": "payment.received",
+                    "correlation_key": "case-123",
+                    "on_event_step_id": "complete",
+                    "timeout_seconds": 3600,
+                    "on_timeout_step_id": "timeout_complete",
+                },
+                {
+                    "id": "complete",
+                    "kind": "complete",
+                    "result": "succeeded",
+                },
+                {
+                    "id": "timeout_complete",
+                    "kind": "complete",
+                    "result": "succeeded",
+                },
+            ],
+        }
+    )
+
+    event_step = definition.steps_by_id["wait_for_payment"]
+
+    assert event_step.kind == "wait_for_event"
+    assert event_step.event_type == "payment.received"
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -152,6 +187,43 @@ def test_workflow_definition_accepts_wait_and_retry_policy() -> None:
                     "to_number": "+15555550100",
                     "next_step_id": "complete",
                     "retry_policy": {"max_attempts": 0},
+                },
+                {
+                    "id": "complete",
+                    "kind": "complete",
+                    "result": "succeeded",
+                },
+            ],
+        },
+        {
+            "name": "incomplete-event-timeout",
+            "initial_step_id": "wait_for_payment",
+            "steps": [
+                {
+                    "id": "wait_for_payment",
+                    "kind": "wait_for_event",
+                    "event_type": "payment.received",
+                    "correlation_key": "case-123",
+                    "on_event_step_id": "complete",
+                    "timeout_seconds": 3600,
+                },
+                {
+                    "id": "complete",
+                    "kind": "complete",
+                    "result": "succeeded",
+                },
+            ],
+        },
+        {
+            "name": "missing-event-branch",
+            "initial_step_id": "wait_for_payment",
+            "steps": [
+                {
+                    "id": "wait_for_payment",
+                    "kind": "wait_for_event",
+                    "event_type": "payment.received",
+                    "correlation_key": "case-123",
+                    "on_event_step_id": "unknown",
                 },
                 {
                     "id": "complete",

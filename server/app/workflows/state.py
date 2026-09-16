@@ -9,6 +9,7 @@ class WorkflowRunStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     WAITING = "waiting"
+    PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -23,19 +24,26 @@ TERMINAL_WORKFLOW_STATUSES = {
 LEGAL_WORKFLOW_TRANSITIONS = {
     WorkflowRunStatus.PENDING: {
         WorkflowRunStatus.RUNNING,
+        WorkflowRunStatus.PAUSED,
         WorkflowRunStatus.CANCELLED,
         WorkflowRunStatus.FAILED,
     },
     WorkflowRunStatus.RUNNING: {
         WorkflowRunStatus.WAITING,
+        WorkflowRunStatus.PAUSED,
         WorkflowRunStatus.COMPLETED,
         WorkflowRunStatus.FAILED,
         WorkflowRunStatus.CANCELLED,
     },
     WorkflowRunStatus.WAITING: {
         WorkflowRunStatus.RUNNING,
+        WorkflowRunStatus.PAUSED,
         WorkflowRunStatus.COMPLETED,
         WorkflowRunStatus.FAILED,
+        WorkflowRunStatus.CANCELLED,
+    },
+    WorkflowRunStatus.PAUSED: {
+        WorkflowRunStatus.RUNNING,
         WorkflowRunStatus.CANCELLED,
     },
     WorkflowRunStatus.COMPLETED: set(),

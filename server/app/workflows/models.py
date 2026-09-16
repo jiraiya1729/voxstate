@@ -133,3 +133,63 @@ class WorkflowTimer(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+
+class WorkflowEventSubscription(Base):
+    """Persisted external-event subscription for one waiting workflow step."""
+
+    __tablename__ = "workflow_event_subscriptions"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id", "step_id", name="uq_workflow_event_subscription_step"
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    run_id: Mapped[UUID] = mapped_column(ForeignKey("workflow_runs.id"), nullable=False)
+    step_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    correlation_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending", server_default="pending"
+    )
+    on_event_step_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    on_timeout_step_id: Mapped[str | None] = mapped_column(String(80))
+    matched_event_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("workflow_external_events.id")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class WorkflowExternalEvent(Base):
+    """Idempotently ingested external event payload."""
+
+    __tablename__ = "workflow_external_events"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_workflow_external_event_key"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    event_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    correlation_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    payload: Mapped[dict[str, object]] = mapped_column(
+        JSON, nullable=False, default=dict, server_default="{}"
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="unmatched", server_default="unmatched"
+    )
+    subscription_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("workflow_event_subscriptions.id")
+    )
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

@@ -10,6 +10,8 @@ from app.workflows.definition import WorkflowDefinition
 from app.workflows.models import (
     WorkflowActivityAttempt,
     WorkflowDefinitionRecord,
+    WorkflowEventSubscription,
+    WorkflowExternalEvent,
     WorkflowRun,
     WorkflowTimer,
 )
@@ -251,7 +253,9 @@ class WorkflowRepository:
     ) -> list[WorkflowTimer]:
         result = await self.session.execute(
             select(WorkflowTimer)
+            .join(WorkflowRun, WorkflowRun.id == WorkflowTimer.run_id)
             .where(WorkflowTimer.status == "pending", WorkflowTimer.due_at <= now)
+            .where(WorkflowRun.status != WorkflowRunStatus.PAUSED.value)
             .order_by(WorkflowTimer.due_at.asc(), WorkflowTimer.id.asc())
             .limit(limit)
             .with_for_update(skip_locked=True)
@@ -276,3 +280,148 @@ class WorkflowRepository:
             timer.status = "cancelled"
         await self.session.flush()
         return len(timers)
+
+    async def create_event_subscription(
+        self,
+        *,
+        run: WorkflowRun,
+        step_id: str,
+        event_type: str,
+        correlation_key: str,
+        on_event_step_id: str,
+        on_timeout_step_id: str | None,
+    ) -> WorkflowEventSubscription:
+        existing = await self.get_event_subscription_for_step(
+            run_id=run.id, step_id=step_id
+        )
+        if existing is not None:
+            return existing
+        subscription = WorkflowEventSubscription(
+            run_id=run.id,
+            step_id=step_id,
+            event_type=event_type,
+            correlation_key=correlation_key,
+            on_event_step_id=on_event_step_id,
+            on_timeout_step_id=on_timeout_step_id,
+        )
+        self.session.add(subscription)
+        await self.session.flush()
+        await self.session.refresh(subscription)
+        return subscription
+
+    async def get_event_subscription_for_step(
+        self, *, run_id: UUID, step_id: str
+    ) -> WorkflowEventSubscription | None:
+        result = await self.session.execute(
+            select(WorkflowEventSubscription).where(
+                WorkflowEventSubscription.run_id == run_id,
+                WorkflowEventSubscription.step_id == step_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def get_event_subscription_by_id(
+        self, subscription_id: UUID
+    ) -> WorkflowEventSubscription | None:
+        return await self.session.get(WorkflowEventSubscription, subscription_id)
+
+    async def get_pending_event_subscription_for_update(
+        self, *, event_type: str, correlation_key: str
+    ) -> WorkflowEventSubscription | None:
+        result = await self.session.execute(
+            select(WorkflowEventSubscription)
+            .join(WorkflowRun, WorkflowRun.id == WorkflowEventSubscription.run_id)
+            .where(
+                WorkflowEventSubscription.event_type == event_type,
+                WorkflowEventSubscription.correlation_key == correlation_key,
+                WorkflowEventSubscription.status == "pending",
+                WorkflowRun.status != WorkflowRunStatus.PAUSED.value,
+            )
+            .order_by(WorkflowEventSubscription.created_at.asc())
+            .with_for_update(skip_locked=True)
+        )
+        return result.scalars().first()
+
+    async def mark_subscription_consumed(
+        self,
+        *,
+        subscription: WorkflowEventSubscription,
+        event_id: UUID,
+    ) -> WorkflowEventSubscription:
+        subscription.status = "consumed"
+        subscription.matched_event_id = event_id
+        await self.session.flush()
+        await self.session.refresh(subscription)
+        return subscription
+
+    async def mark_subscription_timed_out(
+        self, *, run_id: UUID, step_id: str
+    ) -> WorkflowEventSubscription | None:
+        subscription = await self.get_event_subscription_for_step(
+            run_id=run_id, step_id=step_id
+        )
+        if subscription is None or subscription.status != "pending":
+            return subscription
+        subscription.status = "timed_out"
+        await self.session.flush()
+        await self.session.refresh(subscription)
+        return subscription
+
+    async def cancel_pending_event_subscriptions_for_run(self, run_id: UUID) -> int:
+        result = await self.session.execute(
+            select(WorkflowEventSubscription)
+            .where(
+                WorkflowEventSubscription.run_id == run_id,
+                WorkflowEventSubscription.status == "pending",
+            )
+            .with_for_update()
+        )
+        subscriptions = list(result.scalars())
+        for subscription in subscriptions:
+            subscription.status = "cancelled"
+        await self.session.flush()
+        return len(subscriptions)
+
+    async def create_external_event(
+        self,
+        *,
+        event_type: str,
+        correlation_key: str,
+        idempotency_key: str,
+        payload: dict[str, object] | None = None,
+    ) -> tuple[WorkflowExternalEvent, bool]:
+        existing = await self.get_external_event_by_key(idempotency_key)
+        if existing is not None:
+            return existing, False
+        event = WorkflowExternalEvent(
+            event_type=event_type,
+            correlation_key=correlation_key,
+            idempotency_key=idempotency_key,
+            payload=payload or {},
+        )
+        self.session.add(event)
+        await self.session.flush()
+        await self.session.refresh(event)
+        return event, True
+
+    async def get_external_event_by_key(
+        self, idempotency_key: str
+    ) -> WorkflowExternalEvent | None:
+        result = await self.session.execute(
+            select(WorkflowExternalEvent).where(
+                WorkflowExternalEvent.idempotency_key == idempotency_key
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def mark_external_event_matched(
+        self,
+        *,
+        event: WorkflowExternalEvent,
+        subscription_id: UUID,
+    ) -> WorkflowExternalEvent:
+        event.status = "matched"
+        event.subscription_id = subscription_id
+        await self.session.flush()
+        await self.session.refresh(event)
+        return event

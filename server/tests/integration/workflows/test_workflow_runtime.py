@@ -14,7 +14,11 @@ from app.db.database import Database
 from app.workflows.definition import WorkflowDefinition
 from app.workflows.models import WorkflowTimer
 from app.workflows.repository import WorkflowRepository
-from app.workflows.service import WorkflowRunTerminalError, WorkflowService
+from app.workflows.service import (
+    ExternalEventAuthenticationError,
+    WorkflowRunTerminalError,
+    WorkflowService,
+)
 
 
 class RecordingTelephonyGateway:
@@ -156,6 +160,36 @@ def callback_definition_for(agent_id: UUID) -> WorkflowDefinition:
                 },
                 {
                     "id": "complete",
+                    "kind": "complete",
+                    "result": "succeeded",
+                },
+            ],
+        }
+    )
+
+
+def event_definition_for() -> WorkflowDefinition:
+    return WorkflowDefinition.model_validate(
+        {
+            "name": "payment-event-workflow",
+            "initial_step_id": "wait_for_payment",
+            "steps": [
+                {
+                    "id": "wait_for_payment",
+                    "kind": "wait_for_event",
+                    "event_type": "payment.received",
+                    "correlation_key": "case:event-123",
+                    "on_event_step_id": "complete",
+                    "timeout_seconds": 600,
+                    "on_timeout_step_id": "timeout_complete",
+                },
+                {
+                    "id": "complete",
+                    "kind": "complete",
+                    "result": "succeeded",
+                },
+                {
+                    "id": "timeout_complete",
                     "kind": "complete",
                     "result": "succeeded",
                 },
@@ -455,3 +489,187 @@ async def test_callback_request_wakes_and_initiates_one_next_call(
     assert duplicate_due == []
     assert len(timers) == 1
     assert telephony.requested_numbers == ["+15555550903", "+15555550903"]
+
+
+@pytest.mark.asyncio
+async def test_external_event_resumes_matching_wait_once(database: Database) -> None:
+    case = await CaseService(database).create_case(
+        CaseCreate(customer_reference_id="customer-workflow-9")
+    )
+    service = WorkflowService(
+        database=database,
+        call_service=CallService(
+            database=database,
+            telephony=RecordingTelephonyGateway(),
+        ),
+    )
+    definition = await service.create_definition(event_definition_for())
+    run = await service.start_run(definition_id=definition.id, case_id=case.id)
+
+    waiting = await service.advance_run(run.id, now=BASE_TIME)
+    matched = await service.ingest_external_event(
+        event_type="payment.received",
+        correlation_key="case:event-123",
+        idempotency_key="evt-1",
+        payload={"amount": 42},
+        provided_secret="secret",
+        expected_secret="secret",
+        now=BASE_TIME + timedelta(seconds=10),
+    )
+    duplicate = await service.ingest_external_event(
+        event_type="payment.received",
+        correlation_key="case:event-123",
+        idempotency_key="evt-1",
+        payload={"amount": 42},
+        provided_secret="secret",
+        expected_secret="secret",
+        now=BASE_TIME + timedelta(seconds=10),
+    )
+    timeout_results = await service.fire_due_timers(
+        now=BASE_TIME + timedelta(seconds=600)
+    )
+
+    async with database.session() as session:
+        stored = await WorkflowRepository(session).get_run(run.id)
+
+    assert waiting.status == "waiting"
+    assert matched.matched_run_id == run.id
+    assert duplicate.was_duplicate is True
+    assert duplicate.matched_run_id == run.id
+    assert timeout_results == []
+    assert stored is not None
+    assert stored.status == "completed"
+    assert stored.current_step_id == "complete"
+
+
+@pytest.mark.asyncio
+async def test_external_event_rejects_invalid_secret(database: Database) -> None:
+    service = WorkflowService(
+        database=database,
+        call_service=CallService(
+            database=database,
+            telephony=RecordingTelephonyGateway(),
+        ),
+    )
+
+    with pytest.raises(ExternalEventAuthenticationError):
+        await service.ingest_external_event(
+            event_type="payment.received",
+            correlation_key="case:event-123",
+            idempotency_key="evt-bad-secret",
+            provided_secret="wrong",
+            expected_secret="secret",
+        )
+
+
+@pytest.mark.asyncio
+async def test_external_event_timeout_wins_and_late_event_is_noop(
+    database: Database,
+) -> None:
+    case = await CaseService(database).create_case(
+        CaseCreate(customer_reference_id="customer-workflow-10")
+    )
+    service = WorkflowService(
+        database=database,
+        call_service=CallService(
+            database=database,
+            telephony=RecordingTelephonyGateway(),
+        ),
+    )
+    definition = await service.create_definition(event_definition_for())
+    run = await service.start_run(definition_id=definition.id, case_id=case.id)
+
+    await service.advance_run(run.id, now=BASE_TIME)
+    timeout_results = await service.fire_due_timers(
+        now=BASE_TIME + timedelta(seconds=600)
+    )
+    late_event = await service.ingest_external_event(
+        event_type="payment.received",
+        correlation_key="case:event-123",
+        idempotency_key="evt-late",
+        payload={"amount": 42},
+        now=BASE_TIME + timedelta(seconds=601),
+    )
+
+    async with database.session() as session:
+        stored = await WorkflowRepository(session).get_run(run.id)
+
+    assert len(timeout_results) == 1
+    assert timeout_results[0].status == "completed"
+    assert late_event.matched_run_id is None
+    assert stored is not None
+    assert stored.status == "completed"
+    assert stored.current_step_id == "timeout_complete"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_event_wait_suppresses_event_and_timeout(
+    database: Database,
+) -> None:
+    case = await CaseService(database).create_case(
+        CaseCreate(customer_reference_id="customer-workflow-11")
+    )
+    service = WorkflowService(
+        database=database,
+        call_service=CallService(
+            database=database,
+            telephony=RecordingTelephonyGateway(),
+        ),
+    )
+    definition = await service.create_definition(event_definition_for())
+    run = await service.start_run(definition_id=definition.id, case_id=case.id)
+
+    await service.advance_run(run.id, now=BASE_TIME)
+    cancelled = await service.cancel_run(run.id)
+    event_result = await service.ingest_external_event(
+        event_type="payment.received",
+        correlation_key="case:event-123",
+        idempotency_key="evt-after-cancel",
+        now=BASE_TIME + timedelta(seconds=1),
+    )
+    timeout_results = await service.fire_due_timers(
+        now=BASE_TIME + timedelta(seconds=600)
+    )
+
+    assert cancelled.status == "cancelled"
+    assert event_result.matched_run_id is None
+    assert timeout_results == []
+
+
+@pytest.mark.asyncio
+async def test_pause_blocks_event_and_timeout_until_resume(database: Database) -> None:
+    case = await CaseService(database).create_case(
+        CaseCreate(customer_reference_id="customer-workflow-12")
+    )
+    service = WorkflowService(
+        database=database,
+        call_service=CallService(
+            database=database,
+            telephony=RecordingTelephonyGateway(),
+        ),
+    )
+    definition = await service.create_definition(event_definition_for())
+    run = await service.start_run(definition_id=definition.id, case_id=case.id)
+
+    await service.advance_run(run.id, now=BASE_TIME)
+    paused = await service.pause_run(run.id)
+    event_while_paused = await service.ingest_external_event(
+        event_type="payment.received",
+        correlation_key="case:event-123",
+        idempotency_key="evt-paused",
+        now=BASE_TIME + timedelta(seconds=1),
+    )
+    timeout_while_paused = await service.fire_due_timers(
+        now=BASE_TIME + timedelta(seconds=600)
+    )
+    resumed = await service.resume_run(run.id, now=BASE_TIME + timedelta(seconds=601))
+    timeout_after_resume = await service.fire_due_timers(
+        now=BASE_TIME + timedelta(seconds=601)
+    )
+
+    assert paused.status == "paused"
+    assert event_while_paused.matched_run_id is None
+    assert timeout_while_paused == []
+    assert resumed.status == "waiting"
+    assert len(timeout_after_resume) == 1
+    assert timeout_after_resume[0].status == "completed"
