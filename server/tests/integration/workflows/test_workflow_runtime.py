@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
@@ -5,11 +6,13 @@ import pytest
 from app.agents.schemas import AgentCreate
 from app.agents.service import AgentService
 from app.calls.outbound import CallInitiationFailed, CallService
+from app.calls.outcomes import CallOutcome
 from app.calls.telephony import ProviderCall, TelephonyProviderError
 from app.cases.schemas import CaseCreate
 from app.cases.service import CaseService
 from app.db.database import Database
 from app.workflows.definition import WorkflowDefinition
+from app.workflows.models import WorkflowTimer
 from app.workflows.repository import WorkflowRepository
 from app.workflows.service import WorkflowRunTerminalError, WorkflowService
 
@@ -32,6 +35,9 @@ class RecordingTelephonyGateway:
         provider_id = f"CA{self.next_provider_index:032d}"
         self.next_provider_index += 1
         return ProviderCall(provider_id)
+
+
+BASE_TIME = datetime(2026, 9, 16, 12, 0, tzinfo=UTC)
 
 
 async def create_agent(database: Database) -> UUID:
@@ -58,6 +64,95 @@ def definition_for(agent_id: UUID) -> WorkflowDefinition:
                     "agent_id": str(agent_id),
                     "to_number": "+15555550900",
                     "next_step_id": "complete",
+                },
+                {
+                    "id": "complete",
+                    "kind": "complete",
+                    "result": "succeeded",
+                },
+            ],
+        }
+    )
+
+
+def wait_definition_for(agent_id: UUID) -> WorkflowDefinition:
+    return WorkflowDefinition.model_validate(
+        {
+            "name": "wait-then-call",
+            "initial_step_id": "wait_before_call",
+            "steps": [
+                {
+                    "id": "wait_before_call",
+                    "kind": "wait",
+                    "delay_seconds": 300,
+                    "next_step_id": "call_customer",
+                },
+                {
+                    "id": "call_customer",
+                    "kind": "call",
+                    "agent_id": str(agent_id),
+                    "to_number": "+15555550901",
+                    "next_step_id": "complete",
+                },
+                {
+                    "id": "complete",
+                    "kind": "complete",
+                    "result": "succeeded",
+                },
+            ],
+        }
+    )
+
+
+def retry_definition_for(agent_id: UUID) -> WorkflowDefinition:
+    return WorkflowDefinition.model_validate(
+        {
+            "name": "retry-call",
+            "initial_step_id": "call_customer",
+            "steps": [
+                {
+                    "id": "call_customer",
+                    "kind": "call",
+                    "agent_id": str(agent_id),
+                    "to_number": "+15555550902",
+                    "next_step_id": "complete",
+                    "on_no_answer_step_id": "failed_terminal",
+                    "retry_policy": {
+                        "max_attempts": 2,
+                        "delay_seconds": 120,
+                        "backoff": "fixed",
+                        "retry_on": ["no-answer"],
+                    },
+                },
+                {
+                    "id": "complete",
+                    "kind": "complete",
+                    "result": "succeeded",
+                },
+                {
+                    "id": "failed_terminal",
+                    "kind": "complete",
+                    "result": "succeeded",
+                },
+            ],
+        }
+    )
+
+
+def callback_definition_for(agent_id: UUID) -> WorkflowDefinition:
+    return WorkflowDefinition.model_validate(
+        {
+            "name": "callback-call",
+            "initial_step_id": "call_customer",
+            "steps": [
+                {
+                    "id": "call_customer",
+                    "kind": "call",
+                    "agent_id": str(agent_id),
+                    "to_number": "+15555550903",
+                    "next_step_id": "complete",
+                    "callback_step_id": "call_customer",
+                    "retry_policy": {"max_attempts": 1},
                 },
                 {
                     "id": "complete",
@@ -161,7 +256,7 @@ async def test_workflow_marks_run_failed_when_call_scheduling_fails(
         stored = await WorkflowRepository(session).get_run(run.id)
         attempt = await WorkflowRepository(session).get_attempt_by_key(
             run_id=run.id,
-            idempotency_key=f"workflow-run:{run.id}:step:call_customer:call",
+            idempotency_key=f"workflow-run:{run.id}:step:call_customer:call:1",
         )
 
     assert stored is not None
@@ -170,3 +265,193 @@ async def test_workflow_marks_run_failed_when_call_scheduling_fails(
     assert attempt is not None
     assert attempt.status == "failed"
     assert attempt.failure_code == "provider_rejected"
+
+
+@pytest.mark.asyncio
+async def test_durable_wait_wakes_once_after_restart(database: Database) -> None:
+    agent_id = await create_agent(database)
+    case = await CaseService(database).create_case(
+        CaseCreate(customer_reference_id="customer-workflow-4")
+    )
+    telephony = RecordingTelephonyGateway()
+    call_service = CallService(database=database, telephony=telephony)
+    service = WorkflowService(database=database, call_service=call_service)
+    definition = await service.create_definition(wait_definition_for(agent_id))
+    run = await service.start_run(definition_id=definition.id, case_id=case.id)
+
+    waiting = await service.advance_run(run.id, now=BASE_TIME)
+    duplicate_wait = await service.advance_run(run.id, now=BASE_TIME)
+
+    assert waiting.status == "waiting"
+    assert waiting.scheduled_timer_id == duplicate_wait.scheduled_timer_id
+    assert telephony.requested_numbers == []
+
+    restarted_service = WorkflowService(database=database, call_service=call_service)
+    early_results = await restarted_service.fire_due_timers(
+        now=BASE_TIME + timedelta(seconds=299)
+    )
+    due_results = await restarted_service.fire_due_timers(
+        now=BASE_TIME + timedelta(seconds=300)
+    )
+    duplicate_due_results = await restarted_service.fire_due_timers(
+        now=BASE_TIME + timedelta(seconds=300)
+    )
+
+    assert early_results == []
+    assert len(due_results) == 1
+    assert due_results[0].scheduled_call_id is not None
+    assert duplicate_due_results == []
+    assert telephony.requested_numbers == ["+15555550901"]
+
+
+@pytest.mark.asyncio
+async def test_cancellation_suppresses_pending_wait_timer(database: Database) -> None:
+    agent_id = await create_agent(database)
+    case = await CaseService(database).create_case(
+        CaseCreate(customer_reference_id="customer-workflow-5")
+    )
+    telephony = RecordingTelephonyGateway()
+    service = WorkflowService(
+        database=database,
+        call_service=CallService(database=database, telephony=telephony),
+    )
+    definition = await service.create_definition(wait_definition_for(agent_id))
+    run = await service.start_run(definition_id=definition.id, case_id=case.id)
+
+    await service.advance_run(run.id, now=BASE_TIME)
+    cancelled = await service.cancel_run(run.id)
+    results = await service.fire_due_timers(now=BASE_TIME + timedelta(hours=1))
+
+    assert cancelled.status == "cancelled"
+    assert results == []
+    assert telephony.requested_numbers == []
+
+
+@pytest.mark.asyncio
+async def test_retry_policy_schedules_next_attempt_once(database: Database) -> None:
+    agent_id = await create_agent(database)
+    case = await CaseService(database).create_case(
+        CaseCreate(customer_reference_id="customer-workflow-6")
+    )
+    telephony = RecordingTelephonyGateway()
+    call_service = CallService(database=database, telephony=telephony)
+    service = WorkflowService(database=database, call_service=call_service)
+    definition = await service.create_definition(retry_definition_for(agent_id))
+    run = await service.start_run(definition_id=definition.id, case_id=case.id)
+
+    first = await service.advance_run(run.id, now=BASE_TIME)
+    waiting = await service.complete_call_activity(
+        run_id=run.id,
+        call_id=first.scheduled_call_id,
+        call_status="no-answer",
+        now=BASE_TIME,
+    )
+    early = await service.fire_due_timers(now=BASE_TIME + timedelta(seconds=119))
+    due = await service.fire_due_timers(now=BASE_TIME + timedelta(seconds=120))
+    duplicate_due = await service.fire_due_timers(
+        now=BASE_TIME + timedelta(seconds=120)
+    )
+
+    assert waiting.status == "waiting"
+    assert early == []
+    assert len(due) == 1
+    assert due[0].scheduled_new_activity is True
+    assert duplicate_due == []
+    assert telephony.requested_numbers == ["+15555550902", "+15555550902"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_call_outcome_branches_after_max_attempts(
+    database: Database,
+) -> None:
+    agent_id = await create_agent(database)
+    case = await CaseService(database).create_case(
+        CaseCreate(customer_reference_id="customer-workflow-7")
+    )
+    telephony = RecordingTelephonyGateway()
+    service = WorkflowService(
+        database=database,
+        call_service=CallService(database=database, telephony=telephony),
+    )
+    definition = await service.create_definition(retry_definition_for(agent_id))
+    run = await service.start_run(definition_id=definition.id, case_id=case.id)
+
+    first = await service.advance_run(run.id, now=BASE_TIME)
+    await service.complete_call_activity(
+        run_id=run.id,
+        call_id=first.scheduled_call_id,
+        call_status="no-answer",
+        now=BASE_TIME,
+    )
+    retry = (await service.fire_due_timers(now=BASE_TIME + timedelta(seconds=120)))[0]
+    branched = await service.complete_call_activity(
+        run_id=run.id,
+        call_id=retry.scheduled_call_id,
+        call_status="no-answer",
+        now=BASE_TIME + timedelta(seconds=120),
+    )
+    duplicate = await service.complete_call_activity(
+        run_id=run.id,
+        call_id=retry.scheduled_call_id,
+        call_status="no-answer",
+        now=BASE_TIME + timedelta(seconds=120),
+    )
+
+    assert branched.status == "completed"
+    assert branched.current_step_id == "failed_terminal"
+    assert duplicate.id == branched.id
+    assert telephony.requested_numbers == ["+15555550902", "+15555550902"]
+
+
+@pytest.mark.asyncio
+async def test_callback_request_wakes_and_initiates_one_next_call(
+    database: Database,
+) -> None:
+    agent_id = await create_agent(database)
+    case = await CaseService(database).create_case(
+        CaseCreate(customer_reference_id="customer-workflow-8")
+    )
+    telephony = RecordingTelephonyGateway()
+    call_service = CallService(database=database, telephony=telephony)
+    service = WorkflowService(database=database, call_service=call_service)
+    definition = await service.create_definition(callback_definition_for(agent_id))
+    run = await service.start_run(definition_id=definition.id, case_id=case.id)
+    callback_at = BASE_TIME + timedelta(hours=2)
+
+    first = await service.advance_run(run.id, now=BASE_TIME)
+    waiting = await service.complete_call_activity(
+        run_id=run.id,
+        call_id=first.scheduled_call_id,
+        outcome=CallOutcome(
+            kind="callback_requested",
+            callback_at=callback_at,
+            summary="Caller asked for a later call.",
+        ),
+        now=BASE_TIME,
+    )
+
+    assert waiting.status == "waiting"
+
+    restarted_service = WorkflowService(database=database, call_service=call_service)
+    early = await restarted_service.fire_due_timers(
+        now=callback_at - timedelta(seconds=1)
+    )
+    due = await restarted_service.fire_due_timers(now=callback_at)
+    duplicate_due = await restarted_service.fire_due_timers(now=callback_at)
+
+    async with database.session() as session:
+        timers = (
+            await session.execute(
+                WorkflowTimer.__table__.select().where(
+                    WorkflowTimer.run_id == run.id,
+                    WorkflowTimer.kind == "callback",
+                )
+            )
+        ).all()
+
+    assert early == []
+    assert len(due) == 1
+    assert due[0].scheduled_new_activity is True
+    assert duplicate_due == []
+    assert len(timers) == 1
+    assert telephony.requested_numbers == ["+15555550903", "+15555550903"]

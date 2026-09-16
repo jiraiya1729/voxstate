@@ -1,8 +1,9 @@
 """Database repository for durable workflow definitions and runs."""
 
+from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.workflows.definition import WorkflowDefinition
@@ -10,6 +11,7 @@ from app.workflows.models import (
     WorkflowActivityAttempt,
     WorkflowDefinitionRecord,
     WorkflowRun,
+    WorkflowTimer,
 )
 from app.workflows.state import WorkflowRunStatus, resolve_workflow_transition
 
@@ -109,6 +111,7 @@ class WorkflowRepository:
         run: WorkflowRun,
         step_id: str,
         kind: str,
+        attempt_number: int,
         idempotency_key: str,
     ) -> WorkflowActivityAttempt:
         existing = await self.get_attempt_by_key(
@@ -120,12 +123,39 @@ class WorkflowRepository:
             run_id=run.id,
             step_id=step_id,
             kind=kind,
+            attempt_number=attempt_number,
             idempotency_key=idempotency_key,
         )
         self.session.add(attempt)
         await self.session.flush()
         await self.session.refresh(attempt)
         return attempt
+
+    async def count_attempts_for_step(self, *, run_id: UUID, step_id: str) -> int:
+        result = await self.session.execute(
+            select(func.count())
+            .select_from(WorkflowActivityAttempt)
+            .where(
+                WorkflowActivityAttempt.run_id == run_id,
+                WorkflowActivityAttempt.step_id == step_id,
+                WorkflowActivityAttempt.kind == "call",
+            )
+        )
+        return int(result.scalar_one())
+
+    async def get_scheduled_attempt_for_step(
+        self, *, run_id: UUID, step_id: str
+    ) -> WorkflowActivityAttempt | None:
+        result = await self.session.execute(
+            select(WorkflowActivityAttempt)
+            .where(
+                WorkflowActivityAttempt.run_id == run_id,
+                WorkflowActivityAttempt.step_id == step_id,
+                WorkflowActivityAttempt.status == "scheduled",
+            )
+            .order_by(WorkflowActivityAttempt.attempt_number.desc())
+        )
+        return result.scalars().first()
 
     async def mark_attempt_scheduled(
         self,
@@ -151,3 +181,98 @@ class WorkflowRepository:
         await self.session.flush()
         await self.session.refresh(attempt)
         return attempt
+
+    async def mark_attempt_completed(
+        self,
+        *,
+        attempt: WorkflowActivityAttempt,
+        outcome: dict[str, object] | None = None,
+    ) -> WorkflowActivityAttempt:
+        attempt.status = "completed"
+        attempt.failure_code = None
+        attempt.outcome = outcome
+        await self.session.flush()
+        await self.session.refresh(attempt)
+        return attempt
+
+    async def create_timer(
+        self,
+        *,
+        run: WorkflowRun,
+        step_id: str,
+        kind: str,
+        due_at: datetime,
+        wake_step_id: str,
+        idempotency_key: str,
+        payload: dict[str, object] | None = None,
+    ) -> WorkflowTimer:
+        existing = await self.get_timer_by_key(idempotency_key)
+        if existing is not None:
+            return existing
+        timer = WorkflowTimer(
+            run_id=run.id,
+            step_id=step_id,
+            kind=kind,
+            due_at=due_at,
+            wake_step_id=wake_step_id,
+            idempotency_key=idempotency_key,
+            payload=payload or {},
+        )
+        self.session.add(timer)
+        await self.session.flush()
+        await self.session.refresh(timer)
+        return timer
+
+    async def get_timer_by_key(self, idempotency_key: str) -> WorkflowTimer | None:
+        result = await self.session.execute(
+            select(WorkflowTimer).where(
+                WorkflowTimer.idempotency_key == idempotency_key
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def get_pending_timer_for_step(
+        self, *, run_id: UUID, step_id: str, kind: str
+    ) -> WorkflowTimer | None:
+        result = await self.session.execute(
+            select(WorkflowTimer)
+            .where(
+                WorkflowTimer.run_id == run_id,
+                WorkflowTimer.step_id == step_id,
+                WorkflowTimer.kind == kind,
+                WorkflowTimer.status == "pending",
+            )
+            .order_by(WorkflowTimer.due_at.asc(), WorkflowTimer.id.asc())
+        )
+        return result.scalars().first()
+
+    async def claim_due_timers(
+        self, *, now: datetime, limit: int = 100
+    ) -> list[WorkflowTimer]:
+        result = await self.session.execute(
+            select(WorkflowTimer)
+            .where(WorkflowTimer.status == "pending", WorkflowTimer.due_at <= now)
+            .order_by(WorkflowTimer.due_at.asc(), WorkflowTimer.id.asc())
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        timers = list(result.scalars())
+        for timer in timers:
+            timer.status = "fired"
+            timer.fired_at = now
+        await self.session.flush()
+        for timer in timers:
+            await self.session.refresh(timer)
+        return timers
+
+    async def cancel_pending_timers_for_run(self, run_id: UUID) -> int:
+        result = await self.session.execute(
+            select(WorkflowTimer)
+            .where(WorkflowTimer.run_id == run_id, WorkflowTimer.status == "pending")
+            .with_for_update()
+        )
+        timers = list(result.scalars())
+        for timer in timers:
+            timer.status = "cancelled"
+        await self.session.flush()
+        return len(timers)

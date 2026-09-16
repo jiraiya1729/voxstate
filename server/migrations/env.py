@@ -15,6 +15,7 @@ from app.workflows.models import (  # noqa: F401
     WorkflowActivityAttempt,
     WorkflowDefinitionRecord,
     WorkflowRun,
+    WorkflowTimer,
 )
 
 config = context.config

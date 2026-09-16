@@ -19,6 +19,19 @@ StepId = Annotated[
 ]
 
 
+class RetryPolicyDefinition(BaseModel):
+    """Bounded retry policy for a call activity."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_attempts: int = Field(default=1, ge=1, le=20)
+    delay_seconds: int = Field(default=60, ge=1, le=60 * 60 * 24 * 30)
+    backoff: Literal["fixed", "exponential"] = "fixed"
+    retry_on: list[Literal["busy", "no-answer", "failed"]] = Field(
+        default_factory=lambda: ["busy", "no-answer", "failed"]
+    )
+
+
 class CallActivityDefinition(BaseModel):
     """A workflow activity that starts one outbound voice call."""
 
@@ -28,6 +41,22 @@ class CallActivityDefinition(BaseModel):
     kind: Literal["call"]
     agent_id: UUID
     to_number: E164number
+    next_step_id: StepId
+    on_busy_step_id: StepId | None = None
+    on_no_answer_step_id: StepId | None = None
+    on_failed_step_id: StepId | None = None
+    retry_policy: RetryPolicyDefinition = Field(default_factory=RetryPolicyDefinition)
+    callback_step_id: StepId | None = None
+
+
+class WaitStepDefinition(BaseModel):
+    """A durable timer step that wakes a run after persisted business time."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: StepId
+    kind: Literal["wait"]
+    delay_seconds: int = Field(ge=1, le=60 * 60 * 24 * 365)
     next_step_id: StepId
 
 
@@ -42,7 +71,7 @@ class CompleteStepDefinition(BaseModel):
 
 
 WorkflowStep = Annotated[
-    CallActivityDefinition | CompleteStepDefinition,
+    CallActivityDefinition | WaitStepDefinition | CompleteStepDefinition,
     Field(discriminator="kind"),
 ]
 
@@ -87,7 +116,20 @@ class WorkflowDefinition(BaseModel):
             raise ValueError("workflow definition requires a complete step")
 
         for step in self.steps:
-            if step.kind == "call" and step.next_step_id not in step_ids:
-                raise ValueError("call next_step_id must reference an existing step")
+            if step.kind == "call":
+                referenced_ids = [
+                    step.next_step_id,
+                    step.on_busy_step_id,
+                    step.on_no_answer_step_id,
+                    step.on_failed_step_id,
+                    step.callback_step_id,
+                ]
+                for referenced_id in referenced_ids:
+                    if referenced_id is not None and referenced_id not in step_ids:
+                        raise ValueError(
+                            "call branch step IDs must reference existing steps"
+                        )
+            if step.kind == "wait" and step.next_step_id not in step_ids:
+                raise ValueError("wait next_step_id must reference an existing step")
 
         return self
