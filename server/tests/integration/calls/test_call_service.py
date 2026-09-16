@@ -6,6 +6,7 @@ from app.calls.outbound import CallInitiationFailed, CallService
 from app.calls.repository import CallRepository
 from app.calls.telephony import ProviderCall, TelephonyProviderError
 from app.db.database import Database
+from app.events.repository import EventRepository
 
 
 class RecordingTelephonyGateway:
@@ -42,11 +43,14 @@ async def test_successful_provider_request_marks_call_queued(
 
     async with database.session() as session:
         stored = await CallRepository(session).get_by_id(result.id)
+        events = await EventRepository(session).list_for_call(result.id)
 
     assert stored is not None
     assert stored.status == "queued"
     assert stored.provider_call_id == result.provider_call_id
     assert stored.failure_code is None
+    assert [event.event_type for event in events] == ["call.requested", "call.queued"]
+    assert [event.sequence for event in events] == [1, 2]
 
 
 @pytest.mark.asyncio
@@ -61,8 +65,10 @@ async def test_provider_failure_is_persisted_and_not_reported_as_success(
 
     async with database.session() as session:
         stored = await CallRepository(session).get_by_id(captured.value.call_id)
+        events = await EventRepository(session).list_for_call(captured.value.call_id)
 
     assert stored is not None
     assert stored.status == "failed"
     assert stored.provider_call_id is None
     assert stored.failure_code == "21211"
+    assert [event.event_type for event in events] == ["call.requested", "call.failed"]

@@ -17,6 +17,9 @@ from app.calls.lifecycle import (
 )
 from app.calls.repository import CallRepository
 from app.db.database import Database
+from app.events.envelope import EventCreate
+from app.events.repository import EventRepository
+from app.events.sink import DatabaseEventSink
 from app.voice.conversation.response import (
     ConversationSession,
     LanguageModel,
@@ -236,6 +239,7 @@ class MediaSessionService:
                 clear_sink=clear_sink,
                 mark_sink=mark_sink,
             ),
+            event_sink=DatabaseEventSink(self.database),
             **({"system_prompt": system_prompt} if system_prompt is not None else {}),
         )
         transcriber = await self.stt_provider.open_session(
@@ -267,6 +271,12 @@ class MediaSessionService:
             session.provider_call_id,
             session.stream_sid,
         )
+        await self._append_session_event(
+            "conversation.session_started",
+            call_id=session.call_id,
+            stream_sid=session.stream_sid,
+            payload={"provider_call_id": session.provider_call_id},
+        )
         return session
 
     async def receive_media(self, message: MediaMessage) -> None:
@@ -291,6 +301,16 @@ class MediaSessionService:
                 session.stream_sid,
                 session.media_frames_received,
                 session.media_bytes_received,
+            )
+            await self._append_session_event(
+                "conversation.session_stopped",
+                call_id=session.call_id,
+                stream_sid=session.stream_sid,
+                payload={
+                    "provider_call_id": session.provider_call_id,
+                    "media_frames_received": session.media_frames_received,
+                    "media_bytes_received": session.media_bytes_received,
+                },
             )
         return closed
 
@@ -317,6 +337,16 @@ class MediaSessionService:
                 session.media_frames_received,
                 session.media_bytes_received,
             )
+            await self._append_session_event(
+                "conversation.session_disconnected",
+                call_id=session.call_id,
+                stream_sid=session.stream_sid,
+                payload={
+                    "provider_call_id": session.provider_call_id,
+                    "media_frames_received": session.media_frames_received,
+                    "media_bytes_received": session.media_bytes_received,
+                },
+            )
         return closed
 
     @staticmethod
@@ -331,3 +361,22 @@ class MediaSessionService:
             raise InvalidMediaStartError("unsupported channel count")
         if "inbound" not in message.start.tracks:
             raise InvalidMediaStartError("inbound audio track is required")
+
+    async def _append_session_event(
+        self,
+        event_type: str,
+        *,
+        call_id: UUID,
+        stream_sid: str,
+        payload: dict[str, object],
+    ) -> None:
+        async with self.database.session() as session:
+            await EventRepository(session).append(
+                EventCreate(
+                    event_type=event_type,
+                    call_id=call_id,
+                    correlation_id=stream_sid,
+                    idempotency_key=f"call:{call_id}:stream:{stream_sid}:{event_type}",
+                    payload=payload,
+                )
+            )

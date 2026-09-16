@@ -22,6 +22,7 @@ class CallRepository:
         *,
         to_phone_number: str,
         agent_id: UUID | None = None,
+        case_id: UUID | None = None,
         from_phone_number: str | None = None,
         direction: str = "outbound",
         provider_call_id: str | None = None,
@@ -33,6 +34,7 @@ class CallRepository:
             direction=direction,
             initial_agent_id=agent_id,
             active_agent_id=agent_id,
+            case_id=case_id,
             provider_call_id=provider_call_id,
         )
         self.session.add(call)

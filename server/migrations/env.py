@@ -7,8 +7,10 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from app.agents.models import Agent, PhoneNumberRoute, RoutingRule  # noqa: F401
 from app.calls.models import Call, CallTransfer  # noqa: F401
+from app.cases.models import Case  # noqa: F401
 from app.db.base import Base
 from app.db.database import to_async_database_url
+from app.events.models import Event  # noqa: F401
 
 config = context.config
 

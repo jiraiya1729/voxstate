@@ -12,6 +12,8 @@ from time import perf_counter
 from typing import Protocol
 from uuid import UUID
 
+from app.events.envelope import EventCreate
+from app.events.sink import EventSink
 from app.voice.conversation.transcription import TranscriptEvent, TranscriptKind
 from app.voice.conversation.turns import (
     MonotonicClock,
@@ -130,6 +132,7 @@ class ConversationSession:
         response_observer: AssistantResponseObserver,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         clock: MonotonicClock | None = None,
+        event_sink: EventSink | None = None,
     ) -> None:
         self.call_id = call_id
         self.language_model = language_model
@@ -145,6 +148,7 @@ class ConversationSession:
         self._playback_mark: str | None = None
         self._failure: BaseException | None = None
         self._clock = clock or SystemMonotonicClock()
+        self._event_sink = event_sink
         self._pending_speech_end_at: float | None = None
         self._turn_counter = 0
         self._turn_timings: list[TurnTiming] = []
@@ -217,12 +221,17 @@ class ConversationSession:
         if self._current_timing is not None:
             self._current_timing.record(TurnMarker.COMPLETED)
             self._log_timing(self._current_timing.snapshot())
+            await self._append_timing_event(self._current_timing.snapshot())
         if self._state.state is TurnState.SPEAKING:
             self._state.transition(TurnState.LISTENING)
         return True
 
     async def on_transcript(self, event: TranscriptEvent) -> None:
         if event.kind is TranscriptKind.SPEECH_STARTED:
+            await self._append_event(
+                "conversation.speech_started",
+                payload={"state": self._state.state.value},
+            )
             self._speech_active = True
             self._eager_transcript = None
             self._pending_speech_end_at = None
@@ -231,14 +240,32 @@ class ConversationSession:
             return
 
         if event.kind is TranscriptKind.EAGER_END:
+            await self._append_event(
+                "conversation.speech_ended",
+                payload={
+                    "text_length": len(event.text.strip()),
+                    "kind": event.kind.value,
+                },
+            )
             self._eager_transcript = event.text
             self._pending_speech_end_at = self._clock.now()
             return
 
         if event.kind is TranscriptKind.RESUMED:
+            await self._append_event(
+                "conversation.speech_resumed",
+                payload={"state": self._state.state.value},
+            )
             self._speech_active = True
             self._eager_transcript = None
             self._pending_speech_end_at = None
+            return
+
+        if event.kind is TranscriptKind.PARTIAL:
+            await self._append_event(
+                "conversation.transcript_partial",
+                payload={"text_length": len(event.text.strip())},
+            )
             return
 
         if event.kind is not TranscriptKind.FINAL:
@@ -251,6 +278,10 @@ class ConversationSession:
         user_text = event.text.strip()
         if not user_text:
             return
+        await self._append_event(
+            "conversation.transcript_final",
+            payload={"text": user_text, "text_length": len(user_text)},
+        )
 
         logger.info(
             "voice.stt.final call_id=%s chars=%d",
@@ -310,6 +341,11 @@ class ConversationSession:
         )
         started_at = perf_counter()
         timing.record(TurnMarker.LLM_START)
+        await self._append_event(
+            "conversation.agent_turn_started",
+            correlation_id=f"turn:{timing.turn_id}",
+            payload={"turn_id": timing.turn_id, "generation": generation},
+        )
         try:
             assistant_text = await self.language_model.generate(
                 system_prompt=self.system_prompt,
@@ -340,6 +376,16 @@ class ConversationSession:
             self.call_id,
             (perf_counter() - started_at) * 1000,
             len(assistant_text),
+        )
+        await self._append_event(
+            "conversation.agent_response",
+            correlation_id=f"turn:{timing.turn_id}",
+            payload={
+                "turn_id": timing.turn_id,
+                "generation": generation,
+                "text": assistant_text,
+                "text_length": len(assistant_text),
+            },
         )
         logger.debug(
             "voice.llm.text call_id=%s text=%r",
@@ -373,6 +419,7 @@ class ConversationSession:
         if mark_name is None:
             timing.record(TurnMarker.COMPLETED)
             self._log_timing(timing.snapshot())
+            await self._append_timing_event(timing.snapshot())
             self._state.transition(TurnState.LISTENING)
         else:
             self._playback_mark = mark_name
@@ -385,6 +432,14 @@ class ConversationSession:
         if self._current_timing is not None:
             self._current_timing.record(TurnMarker.INTERRUPTED)
             self._log_timing(self._current_timing.snapshot())
+            await self._append_timing_event(self._current_timing.snapshot())
+        await self._append_event(
+            "conversation.agent_interrupted",
+            payload={
+                "generation": interrupted_generation,
+                "previous_state": previous_state.value,
+            },
+        )
         self._state.transition(TurnState.INTERRUPTED)
 
         response_task = self._response_task
@@ -430,3 +485,35 @@ class ConversationSession:
     @staticmethod
     def _format_metric(value: float | None) -> str:
         return "missing" if value is None else f"{value:.1f}"
+
+    async def _append_timing_event(self, timing: TurnTimingSnapshot) -> None:
+        await self._append_event(
+            "conversation.latency_marker",
+            correlation_id=f"turn:{timing.turn_id}",
+            payload={
+                "turn_id": timing.turn_id,
+                "stt_latency_ms": timing.stt_latency_ms,
+                "llm_latency_ms": timing.llm_latency_ms,
+                "tts_first_byte_ms": timing.tts_first_byte_ms,
+                "response_latency_ms": timing.response_latency_ms,
+                "interrupted": timing.timestamp(TurnMarker.INTERRUPTED) is not None,
+            },
+        )
+
+    async def _append_event(
+        self,
+        event_type: str,
+        *,
+        payload: dict[str, object],
+        correlation_id: str | None = None,
+    ) -> None:
+        if self._event_sink is None:
+            return
+        await self._event_sink.append(
+            EventCreate(
+                event_type=event_type,
+                call_id=self.call_id,
+                correlation_id=correlation_id,
+                payload=payload,
+            )
+        )

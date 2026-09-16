@@ -26,6 +26,7 @@ class Call(Base):
     )
     initial_agent_id: Mapped[UUID | None] = mapped_column(ForeignKey("agents.id"))
     active_agent_id: Mapped[UUID | None] = mapped_column(ForeignKey("agents.id"))
+    case_id: Mapped[UUID | None] = mapped_column(ForeignKey("cases.id"))
     status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,

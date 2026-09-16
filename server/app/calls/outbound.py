@@ -10,6 +10,8 @@ from app.agents.repository import AgentRepository
 from app.calls.repository import CallRepository
 from app.calls.telephony import TelephonyGateway, TelephonyProviderError
 from app.db.database import Database
+from app.events.envelope import EventCreate
+from app.events.repository import EventRepository
 
 
 @dataclass(frozen=True)
@@ -41,7 +43,10 @@ class CallService:
         self.telephony = telephony
 
     async def initiate_call(
-        self, to_number: str, agent_id: UUID | None = None
+        self,
+        to_number: str,
+        agent_id: UUID | None = None,
+        case_id: UUID | None = None,
     ) -> InitiatedCall:
         """Persist a pending call, ask Twilio to dial, then record the result."""
         async with self.database.session() as session:
@@ -54,6 +59,20 @@ class CallService:
             pending_call = await CallRepository(session).create(
                 to_phone_number=to_number,
                 agent_id=agent_id,
+                case_id=case_id,
+            )
+            await EventRepository(session).append(
+                EventCreate(
+                    event_type="call.requested",
+                    call_id=pending_call.id,
+                    idempotency_key=f"call:{pending_call.id}:requested",
+                    payload={
+                        "to_phone_number": to_number,
+                        "agent_id": str(agent_id) if agent_id is not None else None,
+                        "case_id": str(case_id) if case_id is not None else None,
+                        "direction": "outbound",
+                    },
+                )
             )
             call_id = pending_call.id
 
@@ -64,9 +83,21 @@ class CallService:
             )
         except TelephonyProviderError as exc:
             async with self.database.session() as session:
-                await CallRepository(session).mark_failed(
+                failed_call = await CallRepository(session).mark_failed(
                     call_id=call_id,
                     failure_code=exc.code,
+                )
+                await EventRepository(session).append(
+                    EventCreate(
+                        event_type="call.failed",
+                        call_id=call_id,
+                        idempotency_key=f"call:{call_id}:initiation_failed:{exc.code}",
+                        payload={
+                            "status": failed_call.status,
+                            "failure_code": exc.code,
+                            "source": "outbound_initiation",
+                        },
+                    )
                 )
             raise CallInitiationFailed(
                 call_id=call_id,
@@ -77,6 +108,21 @@ class CallService:
             call = await CallRepository(session).mark_provider_accepted(
                 call_id=call_id,
                 provider_call_id=provider_call.provider_call_id,
+            )
+            await EventRepository(session).append(
+                EventCreate(
+                    event_type="call.queued",
+                    call_id=call_id,
+                    correlation_id=provider_call.provider_call_id,
+                    idempotency_key=(
+                        f"call:{call_id}:provider:"
+                        f"{provider_call.provider_call_id}:queued"
+                    ),
+                    payload={
+                        "status": call.status,
+                        "provider_call_id": provider_call.provider_call_id,
+                    },
+                )
             )
 
         return InitiatedCall(

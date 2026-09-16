@@ -9,6 +9,8 @@ from uuid import UUID
 from app.calls.lifecycle import UnknownCallError, resolve_call_transition
 from app.calls.repository import CallRepository
 from app.db.database import Database
+from app.events.envelope import EventCreate
+from app.events.repository import EventRepository
 
 
 class CallLifecycleService:
@@ -35,6 +37,22 @@ class CallLifecycleService:
             next_status = resolve_call_transition(call.status, provider_status)
             if next_status is not None:
                 call.status = next_status
+                await EventRepository(session).append(
+                    EventCreate(
+                        event_type=f"call.{next_status.value.replace('-', '_')}",
+                        call_id=call.id,
+                        correlation_id=provider_call_id,
+                        idempotency_key=(
+                            f"call:{call.id}:provider:{provider_call_id}:"
+                            f"status:{provider_status.strip().lower()}"
+                        ),
+                        payload={
+                            "status": next_status.value,
+                            "provider_status": provider_status,
+                            "provider_call_id": provider_call_id,
+                        },
+                    )
+                )
 
             await session.flush()
             await session.refresh(call)

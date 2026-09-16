@@ -1,0 +1,1 @@
+"""Durable customer case domain."""

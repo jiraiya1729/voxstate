@@ -10,6 +10,7 @@ from app.calls.lifecycle_service import CallLifecycleService
 from app.calls.models import Call
 from app.calls.repository import CallRepository
 from app.db.database import Database
+from app.events.repository import EventRepository
 
 
 async def create_pending_call(database: Database) -> Call:
@@ -33,8 +34,11 @@ async def test_early_callback_binds_provider_id_and_advances_status(
     assert status == "initiated"
     async with database.session() as session:
         stored = await CallRepository(session).get_by_id(call.id)
+        events = await EventRepository(session).list_for_call(call.id)
     assert stored is not None
     assert stored.provider_call_id == "CA00000000000000000000000000000020"
+    assert [event.event_type for event in events] == ["call.initiated"]
+    assert events[0].payload["provider_status"] == "initiated"
 
 
 @pytest.mark.asyncio
@@ -52,6 +56,9 @@ async def test_replayed_callback_is_idempotent(database: Database) -> None:
 
     assert first == "ringing"
     assert second == "ringing"
+    async with database.session() as session:
+        events = await EventRepository(session).list_for_call(call.id)
+    assert [event.event_type for event in events] == ["call.ringing"]
 
 
 @pytest.mark.asyncio

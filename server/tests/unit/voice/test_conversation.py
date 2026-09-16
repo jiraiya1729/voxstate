@@ -6,6 +6,7 @@ from uuid import UUID
 import pytest
 
 import app.voice.conversation.response as response_module
+from app.events.envelope import EventCreate
 from app.voice.conversation.response import (
     ConversationSession,
     Message,
@@ -65,6 +66,15 @@ class RecordingResponseObserver:
     async def interrupt(self, call_id: UUID) -> bool:
         del call_id
         return False
+
+
+class RecordingEventSink:
+    def __init__(self) -> None:
+        self.events: list[EventCreate] = []
+
+    async def append(self, event: EventCreate) -> object:
+        self.events.append(event)
+        return object()
 
 
 @pytest.mark.asyncio
@@ -505,3 +515,37 @@ async def test_completed_turn_reports_correlated_latency_boundaries() -> None:
     assert timing.llm_latency_ms == pytest.approx(200)
     assert timing.tts_first_byte_ms == pytest.approx(300)
     assert timing.response_latency_ms == pytest.approx(650)
+
+
+@pytest.mark.asyncio
+async def test_conversation_emits_normalized_events_for_turn() -> None:
+    sink = RecordingEventSink()
+    conversation = ConversationSession(
+        call_id=CALL_ID,
+        language_model=RecordingLanguageModel(["Hello!"]),
+        response_observer=RecordingResponseObserver(),
+        event_sink=sink,
+    )
+
+    await conversation.on_transcript(
+        TranscriptEvent(text="", kind=TranscriptKind.SPEECH_STARTED)
+    )
+    await conversation.on_transcript(
+        TranscriptEvent(text="Hello", kind=TranscriptKind.PARTIAL)
+    )
+    await conversation.on_transcript(
+        TranscriptEvent(text="Hello there", kind=TranscriptKind.FINAL)
+    )
+    await conversation.wait_until_idle()
+
+    assert [event.event_type for event in sink.events] == [
+        "conversation.speech_started",
+        "conversation.transcript_partial",
+        "conversation.transcript_final",
+        "conversation.agent_turn_started",
+        "conversation.agent_response",
+        "conversation.latency_marker",
+    ]
+    assert all(event.call_id == CALL_ID for event in sink.events)
+    assert sink.events[3].correlation_id == "turn:1"
+    assert sink.events[4].payload["text"] == "Hello!"

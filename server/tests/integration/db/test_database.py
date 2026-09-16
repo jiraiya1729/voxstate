@@ -13,7 +13,7 @@ async def test_migration_is_at_expected_revision(
     async with database.session() as session:
         result = await session.execute(text("SELECT version_num FROM alembic_version"))
 
-    assert result.scalar_one() == "0003_agent_routing"
+    assert result.scalar_one() == "0005_durable_cases"
 
 
 @pytest.mark.asyncio
