@@ -11,6 +11,11 @@ from app.cases.models import Case  # noqa: F401
 from app.db.base import Base
 from app.db.database import to_async_database_url
 from app.events.models import Event  # noqa: F401
+from app.workflows.models import (  # noqa: F401
+    WorkflowActivityAttempt,
+    WorkflowDefinitionRecord,
+    WorkflowRun,
+)
 
 config = context.config
 
